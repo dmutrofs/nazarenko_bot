@@ -26,7 +26,8 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || DEFAULT_MODELS.join(","))
   .filter(Boolean);
 
 const bot = new Bot(token);
-const ai = new GoogleGenAI({ apiKey: geminiKey });
+// Явно v1beta: preview-моделі та аліаси "-latest" у v1 повертають 404
+const ai = new GoogleGenAI({ apiKey: geminiKey, httpOptions: { apiVersion: "v1beta" } });
 
 const SYSTEM_PROMPT = `Ти учасник українського чату. Відповідай за такими правилами:
 1. Стиль: агресивний, зневажливий, грубий, з нецензурною лексикою.
@@ -51,7 +52,7 @@ function getRepliedMessage(ctx, threadId) {
   return replied && replied.message_id !== threadId ? replied : undefined;
 }
 
-const GEMINI_TIMEOUT_MS = 20_000; // на одну модель
+const GEMINI_TIMEOUT_MS = 25_000; // на одну модель
 const COOLDOWN_MS = 5 * 60_000; // скільки пропускати модель після збою
 
 // Користувачі, до яких треба звертатись ввічливо (ID через кому в .env, необов'язково)
@@ -119,23 +120,36 @@ function shouldFallback(err) {
 
 const cooldownUntil = new Map(); // модель -> до якого часу її пропускаємо
 
+// Скільки пропускати модель після збою: хвилинний ліміт за retryDelay з відповіді,
+// денний довше (бот сам повернеться до моделі, коли пауза мине)
+function cooldownFor(err) {
+  const msg = String(err.message);
+  if (/PerDay/i.test(msg)) return 30 * 60_000;
+  const m = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/);
+  if (m) return Math.ceil(Number(m[1])) * 1000 + 1000;
+  return err.status === 429 ? 60_000 : COOLDOWN_MS;
+}
+
 async function askGemini(prompt) {
   const now = Date.now();
   const ready = GEMINI_MODELS.filter((m) => (cooldownUntil.get(m) ?? 0) <= now);
   const queue = ready.length ? ready : GEMINI_MODELS; // якщо всі "на паузі", пробуємо всі
-  let lastErr;
+  const failures = [];
 
   for (const model of queue) {
     try {
       return await callModel(model, prompt);
     } catch (err) {
-      lastErr = err;
       if (!shouldFallback(err)) throw err;
-      cooldownUntil.set(model, Date.now() + COOLDOWN_MS);
-      console.warn(`[sendai] ${model} недоступна (${err.status ?? err.message}), пробую наступну`);
+      const wait = cooldownFor(err);
+      cooldownUntil.set(model, Date.now() + wait);
+      failures.push(`${model}: ${err.status ?? err.message}`);
+      console.warn(
+        `[sendai] ${model} недоступна (${err.status ?? err.message}), пауза ${Math.round(wait / 1000)} с, пробую наступну`
+      );
     }
   }
-  throw lastErr;
+  throw new Error(`усі моделі недоступні (${failures.join("; ")})`);
 }
 
 // --- /send <текст> ---
