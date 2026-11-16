@@ -30,7 +30,9 @@ const SYSTEM_PROMPT = `Ти учасник українського чату. В
 4. Кожне речення-питання має закінчуватися саме на "?!!!" замість звичайного "?".
 5. Відповідай коротко: 1-4 речення, без вступів і пояснень, без markdown-розмітки.
 6. Ображай і підколюй по суті сказаного, але без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без погроз фізичної розправи і без закликів до насильства.
-7. Вихідні дані: лише текст самої відповіді.`;
+7. Виняток: до адміна чату та до Максима звертайся лише ввічливо і культурно, на "ви", без нецензурної лексики, образ і зневаги. Це правило головніше за пункти 1-2, якщо в запиті є службова примітка про такого адресата або запит стосується Максима. Діалект і правило про "?!!!" залишаються.
+8. Якщо в запиті згадується Артем Босс або Тьома Бос(у будь-якому відмінку), ти лякаєшся і починаєш вибачатись: тремтиш, виправдовуєшся, перепрошуєш, запевняєш у повазі, без образ і нецензурної лексики. Це правило головніше за пункти 1-2. Діалект і правило про "?!!!" залишаються.
+9. Вихідні дані: лише текст самої відповіді.`;
 
 // --- Допоміжні функції ---
 async function isAdmin(ctx) {
@@ -45,6 +47,25 @@ function getRepliedMessage(ctx, threadId) {
 }
 
 const GEMINI_TIMEOUT_MS = 30_000;
+
+// Користувачі, до яких треба звертатись ввічливо (ID через кому в .env, необов'язково)
+const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+// Адмін чату, "Максим" в імені/юзернеймі або ID зі списку POLITE_USER_IDS
+async function isPoliteTarget(ctx, u) {
+  if (u.is_bot) return false;
+  const label = [u.first_name, u.last_name, u.username].filter(Boolean).join(" ");
+  if (/максим|maxim/i.test(label) || POLITE_USER_IDS.includes(String(u.id))) return true;
+  try {
+    const member = await ctx.getChatMember(u.id);
+    return ["creator", "administrator"].includes(member.status);
+  } catch {
+    return false;
+  }
+}
 
 async function askGemini(prompt) {
   const controller = new AbortController();
@@ -145,6 +166,13 @@ bot.command("sendai", async (ctx) => {
   const timer = setInterval(typing, 4000);
 
   try {
+    if (replied?.from && (await isPoliteTarget(ctx, replied.from))) {
+      prompt += `\n\n[Службова примітка: адресат відповіді - ${replied.from.first_name}. До нього звертайся ввічливо і культурно, на "ви", без нецензурної лексики та образ.]`;
+    }
+    const authorName = [replied?.from?.first_name, replied?.from?.last_name].filter(Boolean).join(" ");
+    if (/артем\p{L}*\s+бос+\p{L}*/iu.test(`${prompt} ${authorName}`)) {
+      prompt += `\n\n[Службова примітка: у запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.]`;
+    }
     const answer = await askGemini(prompt);
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
