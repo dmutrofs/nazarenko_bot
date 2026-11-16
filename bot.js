@@ -18,7 +18,7 @@ if (!geminiKey) {
 }
 
 // Назву моделі можна змінити через GEMINI_MODEL без правок коду
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 
 const bot = new Bot(token);
 const ai = new GoogleGenAI({ apiKey: geminiKey });
@@ -44,16 +44,39 @@ function getRepliedMessage(ctx, threadId) {
   return replied && replied.message_id !== threadId ? replied : undefined;
 }
 
+const GEMINI_TIMEOUT_MS = 30_000;
+
 async function askGemini(prompt) {
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: prompt,
-    config: { systemInstruction: SYSTEM_PROMPT },
-  });
-  // Страховка: навіть якщо модель випадково поставить довге тире
-  const text = (response.text ?? "").replaceAll("—", "-").trim();
-  if (!text) throw new Error("Gemini повернув порожню відповідь (можливо, спрацював фільтр безпеки)");
-  return text.slice(0, 4096); // ліміт Telegram
+  const controller = new AbortController();
+  const started = Date.now();
+  console.log(`[sendai] запит до ${GEMINI_MODEL}...`);
+
+  // Таймаут: якщо Gemini не відповів, не висимо вічно
+  const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timeout = new Promise((_, reject) =>
+    controller.signal.addEventListener("abort", () =>
+      reject(new Error(`Gemini не відповів за ${GEMINI_TIMEOUT_MS / 1000} с`))
+    )
+  );
+
+  try {
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: prompt,
+        config: { systemInstruction: SYSTEM_PROMPT, abortSignal: controller.signal },
+      }),
+      timeout,
+    ]);
+    console.log(`[sendai] відповідь за ${Date.now() - started} мс`);
+
+    // Страховка: навіть якщо модель випадково поставить довге тире
+    const text = (response.text ?? "").replaceAll("—", "-").trim();
+    if (!text) throw new Error("Gemini повернув порожню відповідь (можливо, спрацював фільтр безпеки)");
+    return text.slice(0, 4096); // ліміт Telegram
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- /send <текст> ---
