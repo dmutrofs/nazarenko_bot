@@ -17,8 +17,13 @@ if (!geminiKey) {
   process.exit(1);
 }
 
-// Назву моделі можна змінити через GEMINI_MODEL без правок коду
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+// Ланцюжок моделей через кому (GEMINI_MODELS): перша основна, решта запасні.
+// Якщо в основної вичерпано ліміт чи вона недоступна, бот переходить до наступної.
+const DEFAULT_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-flash-lite-latest"];
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || DEFAULT_MODELS.join(","))
+  .split(",")
+  .map((m) => m.trim())
+  .filter(Boolean);
 
 const bot = new Bot(token);
 const ai = new GoogleGenAI({ apiKey: geminiKey });
@@ -31,7 +36,7 @@ const SYSTEM_PROMPT = `Ти учасник українського чату. В
 5. Відповідай коротко: 1-4 речення, без вступів і пояснень, без markdown-розмітки.
 6. Ображай і підколюй по суті сказаного, але без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без погроз фізичної розправи і без закликів до насильства.
 7. Виняток: до адміна чату та до Максима звертайся лише ввічливо і культурно, на "ви", без нецензурної лексики, образ і зневаги. Це правило головніше за пункти 1-2, якщо в запиті є службова примітка про такого адресата або запит стосується Максима. Діалект і правило про "?!!!" залишаються.
-8. Якщо в запиті згадується Артем Босс або Тьома Бос(у будь-якому відмінку), ти лякаєшся і починаєш вибачатись: тремтиш, виправдовуєшся, перепрошуєш, запевняєш у повазі, без образ і нецензурної лексики. Це правило головніше за пункти 1-2. Діалект і правило про "?!!!" залишаються.
+8. Якщо в запиті згадується Артем Босс (у будь-якому відмінку), ти лякаєшся і починаєш вибачатись: тремтиш, виправдовуєшся, перепрошуєш, запевняєш у повазі, без образ і нецензурної лексики. Це правило головніше за пункти 1-2. Діалект і правило про "?!!!" залишаються.
 9. Вихідні дані: лише текст самої відповіді.`;
 
 // --- Допоміжні функції ---
@@ -46,7 +51,8 @@ function getRepliedMessage(ctx, threadId) {
   return replied && replied.message_id !== threadId ? replied : undefined;
 }
 
-const GEMINI_TIMEOUT_MS = 30_000;
+const GEMINI_TIMEOUT_MS = 20_000; // на одну модель
+const COOLDOWN_MS = 5 * 60_000; // скільки пропускати модель після збою
 
 // Користувачі, до яких треба звертатись ввічливо (ID через кому в .env, необов'язково)
 const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
@@ -67,37 +73,69 @@ async function isPoliteTarget(ctx, u) {
   }
 }
 
-async function askGemini(prompt) {
+// Один запит до конкретної моделі
+async function callModel(model, prompt) {
   const controller = new AbortController();
   const started = Date.now();
-  console.log(`[sendai] запит до ${GEMINI_MODEL}...`);
+  console.log(`[sendai] запит до ${model}...`);
 
-  // Таймаут: якщо Gemini не відповів, не висимо вічно
+  // Таймаут: якщо модель не відповіла, не висимо вічно
   const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   const timeout = new Promise((_, reject) =>
-    controller.signal.addEventListener("abort", () =>
-      reject(new Error(`Gemini не відповів за ${GEMINI_TIMEOUT_MS / 1000} с`))
-    )
+    controller.signal.addEventListener("abort", () => {
+      const err = new Error(`${model} не відповіла за ${GEMINI_TIMEOUT_MS / 1000} с`);
+      err.isTimeout = true;
+      reject(err);
+    })
   );
 
   try {
     const response = await Promise.race([
       ai.models.generateContent({
-        model: GEMINI_MODEL,
+        model,
         contents: prompt,
         config: { systemInstruction: SYSTEM_PROMPT, abortSignal: controller.signal },
       }),
       timeout,
     ]);
-    console.log(`[sendai] відповідь за ${Date.now() - started} мс`);
+    console.log(`[sendai] ${model} відповіла за ${Date.now() - started} мс`);
 
     // Страховка: навіть якщо модель випадково поставить довге тире
     const text = (response.text ?? "").replaceAll("—", "-").trim();
-    if (!text) throw new Error("Gemini повернув порожню відповідь (можливо, спрацював фільтр безпеки)");
+    if (!text) throw new Error(`${model} повернула порожню відповідь (можливо, спрацював фільтр безпеки)`);
     return text.slice(0, 4096); // ліміт Telegram
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Чи варто пробувати іншу модель: ліміт (429), перевантаження (500/503/504),
+// модель недоступна (404) або таймаут. Помилки 400/403 (запит, ключ) однакові для всіх моделей.
+function shouldFallback(err) {
+  if (err.isTimeout) return true;
+  if ([404, 429, 500, 503, 504].includes(err.status)) return true;
+  return /RESOURCE_EXHAUSTED|UNAVAILABLE|quota/i.test(String(err.message));
+}
+
+const cooldownUntil = new Map(); // модель -> до якого часу її пропускаємо
+
+async function askGemini(prompt) {
+  const now = Date.now();
+  const ready = GEMINI_MODELS.filter((m) => (cooldownUntil.get(m) ?? 0) <= now);
+  const queue = ready.length ? ready : GEMINI_MODELS; // якщо всі "на паузі", пробуємо всі
+  let lastErr;
+
+  for (const model of queue) {
+    try {
+      return await callModel(model, prompt);
+    } catch (err) {
+      lastErr = err;
+      if (!shouldFallback(err)) throw err;
+      cooldownUntil.set(model, Date.now() + COOLDOWN_MS);
+      console.warn(`[sendai] ${model} недоступна (${err.status ?? err.message}), пробую наступну`);
+    }
+  }
+  throw lastErr;
 }
 
 // --- /send <текст> ---
