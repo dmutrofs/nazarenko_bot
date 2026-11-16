@@ -19,7 +19,15 @@ if (!geminiKey) {
 
 // Ланцюжок моделей через кому (GEMINI_MODELS): перша основна, решта запасні.
 // Якщо в основної вичерпано ліміт чи вона недоступна, бот переходить до наступної.
-const DEFAULT_MODELS = ["gemini-3.5-flash", "gemini-3-flash-preview", "gemini-flash-lite-latest"];
+// Порядок: спочатку якісніша модель із залишком ліміту, далі Lite з великим денним лімітом (500),
+// наприкінці Flash-моделі з малим денним лімітом (20), які легко вичерпуються.
+const DEFAULT_MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-3.6-flash",
+  "gemini-3-flash-preview",
+];
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || DEFAULT_MODELS.join(","))
   .split(",")
   .map((m) => m.trim())
@@ -61,8 +69,8 @@ const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
   .map((x) => x.trim())
   .filter(Boolean);
 
-// Хто може "налякати" бота згадкою Артема Босса: Дмитро (головний адмін) і Максим
-const BOSS_FEAR_USER_IDS = new Set([628787612, 461210309]);
+// Хто може "налякати" бота згадкою Артема Босса: Дмитро (головний адмін), Максим і Женя
+const BOSS_FEAR_USER_IDS = new Set([628787612, 461210309, 461427807]);
 const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu; // Артем/Тьома Бос(с) у будь-якому відмінку
 
 // Адмін чату, "Максим" в імені/юзернеймі або ID зі списку POLITE_USER_IDS
