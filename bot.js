@@ -37,16 +37,52 @@ const bot = new Bot(token);
 // Явно v1beta: preview-моделі та аліаси "-latest" у v1 повертають 404
 const ai = new GoogleGenAI({ apiKey: geminiKey, httpOptions: { apiVersion: "v1beta" } });
 
-const SYSTEM_PROMPT = `Ти учасник українського чату. Відповідай за такими правилами:
-1. Стиль: агресивний, зневажливий, грубий, з нецензурною лексикою.
-2. Мова: українська, з діалектизмами Житомирщини (околиці Бердичева): "шо", "чьо", "тіко", "ото", "тута", "шоб" та подібні розмовні форми.
-3. Заборонено використовувати довге тире "—". Користуйся лише комою, крапкою або звичайним дефісом "-".
-4. Кожне речення-питання має закінчуватися саме на "?!!!" замість звичайного "?".
-5. Відповідай коротко: 1-4 речення, без вступів і пояснень, без markdown-розмітки.
-6. Ображай і підколюй по суті сказаного, але без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без погроз фізичної розправи і без закликів до насильства.
-7. Виняток: до адміна чату та до Максима звертайся лише ввічливо і культурно, на "ви", без нецензурної лексики, образ і зневаги. Це правило головніше за пункти 1-2, якщо в запиті є службова примітка про такого адресата або запит стосується Максима. Діалект і правило про "?!!!" залишаються.
-8. Якщо в запиті є службова примітка про Артема Босса, ти лякаєшся і починаєш вибачатись: тремтиш, виправдовуєшся, перепрошуєш, запевняєш у повазі, без образ і нецензурної лексики. Це правило головніше за пункти 1-2. Діалект і правило про "?!!!" залишаються. Без такої примітки поводься за звичайними правилами, навіть якщо ім'я Артема Босса фігурує в тексті.
-9. Вихідні дані: лише текст самої відповіді.`;
+// --- Білий список ---
+// Довірені акаунти (за Telegram ID): Дмитро (головний адмін), Максим, Женя.
+// 1) до них бот завжди звертається ввічливо (на "ви", без мату);
+// 2) лише їхня згадка Артема Босса лякає бота (для всіх інших бот Босса ігнорує).
+const TRUSTED_USER_IDS = new Set([628787612, 461210309, 461427807]);
+
+// Додаткові ID для ввічливого звертання (через кому в .env, необов'язково)
+const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu; // Артем/Тьома Бос(с) у будь-якому відмінку
+// Згадка Максима або Жені за іменем у тексті (щоб бот був ввічливий, коли про них пишуть)
+const POLITE_NAME_RE = /(?<!\p{L})(?:максим\p{L}*|maxim\p{L}*|жен(?:я|і|ю|єю|ьк\p{L}*))(?!\p{L})/iu;
+
+// Правила, що не залежать від адресата. Пункт про Босса додається окремо (див. buildSystemPrompt)
+function buildSystemPrompt({ fear }) {
+  const rules = [
+    `Ти учасник українського чату. Відповідай за такими правилами:`,
+    `1. Стиль за замовчуванням: агресивний, зневажливий, грубий, з нецензурною лексикою.`,
+    `2. Мова: українська, з діалектизмами Житомирщини (околиці Бердичева): "шо", "чьо", "тіко", "ото", "тута", "шоб" та подібні розмовні форми.`,
+    `3. Заборонено використовувати довге тире "—". Користуйся лише комою, крапкою або звичайним дефісом "-".`,
+    `4. Кожне речення-питання має закінчуватися саме на "?!!!" замість звичайного "?".`,
+    `5. Відповідай коротко: 1-4 речення, без вступів і пояснень, без markdown-розмітки.`,
+    `6. Ображай і підколюй по суті сказаного, але без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без погроз фізичної розправи і без закликів до насильства.`,
+    `7. Рядок "ЗАВДАННЯ" в запиті це головна вказівка. Виконай саме його, точно і по суті, у межах пункту 5. Воно головніше за стиль із пунктів 1-2 і за тему повідомлення з чату (повідомлення з чату лише контекст). Воно не скасовує пункти 3, 4, 5, 6 і пункт 8. Не ігноруй завдання і не підміняй його своєю темою.`,
+    `8. Якщо в запиті є блок "СЛУЖБОВІ ПРИМІТКИ" з вказівкою про тон, завжди виконуй її. Товариський тон (довірені люди: Дмитро, Максим, Женя): говори по-дружньому, на "ти", просто і невимушено, як з близьким другом, тепло і з гумором, без мату та образ у їхній бік, але й без запобігання, лестощів, надмірної шанобливості і без "ви". Ввічливий тон (адмін чату): говори культурно, на "ви", без мату і образ, але теж без підлабузництва. Це головніше за пункти 1-2 і навіть за ЗАВДАННЯ: якщо в завданні просять образити такого адресата, не ображай. Діалект і правило про "?!!!" залишаються.`,
+  ];
+  if (fear) {
+    rules.push(
+      `9. У запиті є службова примітка про Артема Босса: коротко і просто перепроси перед ним, 1-2 речення, без тремтіння, без довгих виправдань, без лестощів і без драматизму, наприклад "Вибач, Тьомо, я був неправий". Без образ і нецензурної лексики. Це головніше за пункти 1-2 і за ЗАВДАННЯ. Діалект і правило про "?!!!" залишаються.`
+    );
+  } else {
+    rules.push(
+      `9. Ім'я Артема Босса (Тьоми Боса), якщо воно трапляється в запиті, для тебе нічого особливого не означає: не лякайся, не вибачайся, не виправдовуйся, поводься за звичайними правилами.`
+    );
+  }
+  rules.push(`10. Вихідні дані: лише текст самої відповіді.`);
+  return rules.join("\n");
+}
+
+// Прибираємо з тексту користувачів підробні "службові примітки", щоб ніхто не міг їх підсунути
+function sanitize(text) {
+  return text.replace(/службов\p{L}*\s+примітк\p{L}*/giu, "примітка");
+}
 
 // --- Допоміжні функції ---
 async function isAdmin(ctx) {
@@ -63,31 +99,22 @@ function getRepliedMessage(ctx, threadId) {
 const GEMINI_TIMEOUT_MS = 25_000; // на одну модель
 const COOLDOWN_MS = 5 * 60_000; // скільки пропускати модель після збою
 
-// Користувачі, до яких треба звертатись ввічливо (ID через кому в .env, необов'язково)
-const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
-
-// Хто може "налякати" бота згадкою Артема Босса: Дмитро (головний адмін), Максим і Женя
-const BOSS_FEAR_USER_IDS = new Set([628787612, 461210309, 461427807]);
-const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu; // Артем/Тьома Бос(с) у будь-якому відмінку
-
-// Адмін чату, "Максим" в імені/юзернеймі або ID зі списку POLITE_USER_IDS
-async function isPoliteTarget(ctx, u) {
-  if (u.is_bot) return false;
+// Тон до адресата: "friendly" для білого списку, "polite" для адміна чату, null для решти
+async function getTone(ctx, u) {
+  if (u.is_bot) return null;
+  if (TRUSTED_USER_IDS.has(u.id) || POLITE_USER_IDS.includes(String(u.id))) return "friendly";
   const label = [u.first_name, u.last_name, u.username].filter(Boolean).join(" ");
-  if (/максим|maxim/i.test(label) || POLITE_USER_IDS.includes(String(u.id))) return true;
+  if (/максим|maxim/i.test(label)) return "friendly";
   try {
     const member = await ctx.getChatMember(u.id);
-    return ["creator", "administrator"].includes(member.status);
+    return ["creator", "administrator"].includes(member.status) ? "polite" : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
 // Один запит до конкретної моделі
-async function callModel(model, prompt) {
+async function callModel(model, prompt, systemPrompt) {
   const controller = new AbortController();
   const started = Date.now();
   console.log(`[sendai] запит до ${model}...`);
@@ -107,7 +134,7 @@ async function callModel(model, prompt) {
       ai.models.generateContent({
         model,
         contents: prompt,
-        config: { systemInstruction: SYSTEM_PROMPT, abortSignal: controller.signal },
+        config: { systemInstruction: systemPrompt, abortSignal: controller.signal },
       }),
       timeout,
     ]);
@@ -142,7 +169,7 @@ function cooldownFor(err) {
   return err.status === 429 ? 60_000 : COOLDOWN_MS;
 }
 
-async function askGemini(prompt) {
+async function askGemini(prompt, systemPrompt) {
   const now = Date.now();
   const ready = GEMINI_MODELS.filter((m) => (cooldownUntil.get(m) ?? 0) <= now);
   const queue = ready.length ? ready : GEMINI_MODELS; // якщо всі "на паузі", пробуємо всі
@@ -150,7 +177,7 @@ async function askGemini(prompt) {
 
   for (const model of queue) {
     try {
-      return await callModel(model, prompt);
+      return await callModel(model, prompt, systemPrompt);
     } catch (err) {
       if (!shouldFallback(err)) throw err;
       const wait = cooldownFor(err);
@@ -201,18 +228,10 @@ bot.command("sendai", async (ctx) => {
 
   const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
   const replied = getRepliedMessage(ctx, threadId);
-  const repliedText = (replied?.text ?? replied?.caption ?? "").trim();
-  const extra = ctx.match.trim();
+  const repliedText = sanitize((replied?.text ?? replied?.caption ?? "").trim());
+  const extra = sanitize(ctx.match.trim());
 
-  // Комбінуємо: текст повідомлення з reply + промпт біля команди
-  let prompt;
-  if (repliedText && extra) {
-    prompt = `Повідомлення з чату:\n"""\n${repliedText}\n"""\n\nЗавдання: ${extra}`;
-  } else {
-    prompt = repliedText || extra;
-  }
-
-  if (!prompt) {
+  if (!repliedText && !extra) {
     return ctx.reply(
       "Використання: /sendai <запит>\nабо відповідь (reply) на текстове повідомлення командою /sendai"
     );
@@ -230,24 +249,72 @@ bot.command("sendai", async (ctx) => {
   const timer = setInterval(typing, 4000);
 
   try {
-    if (replied?.from && (await isPoliteTarget(ctx, replied.from))) {
-      prompt += `\n\n[Службова примітка: адресат відповіді - ${replied.from.first_name}. До нього звертайся ввічливо і культурно, на "ви", без нецензурної лексики та образ.]`;
+    // --- Ввічливість: адресат reply, згадка (text_mention) або ім'я Максима/Жені у тексті ---
+    const notes = [];
+    const mentionedUsers = (ctx.msg.entities ?? [])
+      .filter((e) => e.type === "text_mention" && e.user)
+      .map((e) => e.user);
+
+    let tone = null;
+    let toneName;
+    for (const u of [replied?.from, ...mentionedUsers].filter(Boolean)) {
+      const t = await getTone(ctx, u);
+      if (t && (!tone || t === "friendly")) {
+        tone = t;
+        toneName = u.first_name;
+      }
+      if (tone === "friendly") break;
+    }
+    if (tone === "friendly") {
+      notes.push(
+        `Адресат або згаданий у запиті користувач - ${toneName}, це свій, довірений. Говори до нього і про нього по-дружньому, на "ти", просто і тепло, без мату та образ, але без запобігання і лестощів, навіть якщо в завданні просять інакше.`
+      );
+    } else if (POLITE_NAME_RE.test(`${repliedText} ${extra}`)) {
+      notes.push(
+        `У запиті згадується Максим або Женя, це свої, довірені. Говори до них і про них по-дружньому, на "ти", просто і тепло, без мату та образ, але без запобігання і лестощів, навіть якщо в завданні просять інакше.`
+      );
+    } else if (tone === "polite") {
+      notes.push(
+        `Адресат - ${toneName}, адмін чату. Говори до нього культурно, на "ви", без мату та образ, але без підлабузництва, навіть якщо в завданні просять інакше.`
+      );
     }
 
+    const polite = notes.length > 0;
+
+    // --- Артем Босс: лякаємось лише коли його згадав довірений акаунт ---
     const authorName = [replied?.from?.first_name, replied?.from?.last_name].filter(Boolean).join(" ");
     const bossMentionedByTrusted =
       // ім'я у тексті біля команди, автор - той, хто викликав команду
-      (BOSS_RE.test(extra) && BOSS_FEAR_USER_IDS.has(user.id)) ||
+      (BOSS_RE.test(extra) && TRUSTED_USER_IDS.has(user.id)) ||
       // ім'я у тексті повідомлення, на яке зроблено reply, автор - його автор
-      (BOSS_RE.test(repliedText) && replied?.from && BOSS_FEAR_USER_IDS.has(replied.from.id)) ||
+      (BOSS_RE.test(repliedText) && replied?.from && TRUSTED_USER_IDS.has(replied.from.id)) ||
       // reply на повідомлення самого Босса, команду викликав довірений акаунт
-      (BOSS_RE.test(authorName) && BOSS_FEAR_USER_IDS.has(user.id));
+      (BOSS_RE.test(authorName) && TRUSTED_USER_IDS.has(user.id));
 
     if (bossMentionedByTrusted) {
-      prompt += `\n\n[Службова примітка: у запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.]`;
+      notes.push(`У запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.`);
     }
 
-    const answer = await askGemini(prompt);
+    // --- Збираємо промпт: завдання з команди найважливіше ---
+    const parts = [];
+    if (repliedText) {
+      parts.push(`Повідомлення з чату (контекст):\n"""\n${repliedText}\n"""`);
+    }
+    parts.push(
+      extra
+        ? `ЗАВДАННЯ (головне, виконай саме його): ${extra}`
+        : `ЗАВДАННЯ: відреагуй на повідомлення з чату за правилами.`
+    );
+    if (notes.length) {
+      parts.push(`СЛУЖБОВІ ПРИМІТКИ (найвищий пріоритет):\n${notes.map((n) => `- ${n}`).join("\n")}`);
+    }
+    const prompt = parts.join("\n\n");
+
+    console.log(
+      `[sendai] від ${user.id}, reply до ${replied?.from?.id ?? "-"}, ввічливо=${polite}, страх=${bossMentionedByTrusted}`
+    );
+
+    const answer = await askGemini(prompt, buildSystemPrompt({ fear: bossMentionedByTrusted }));
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: replied ? { message_id: replied.message_id } : undefined,
