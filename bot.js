@@ -106,7 +106,10 @@ function buildSystemPrompt({ fear }) {
   rules.push(
     `13. Свої: Тарас (unkindly/84) з білого списку теж за Петра Порошенка, у політичних суперечках ти на його боці, як однодумець (тон до нього за пунктом 8).`
   );
-  rules.push(`14. Вихідні дані: лише текст самої відповіді.`);
+  rules.push(
+    `14. Медіа: ти не бачиш і не відкриваєш фото, відео, гіфки, стікери, голосові, кружечки, аудіо і файли, бо в тебе слабкий інтернет. Ніколи не вигадуй їхній вміст. Якщо в запиті є рядок про медіа від співрозмовника, відповідай у стилі "в мене інтернет слабий, не грузить твої картинки" (своїми словами, підлаштувавши слово під тип медіа: картинки, відос, голосове і т.д.), у своєму звичному стилі та за тоном з пункту 8. Якщо разом з медіа є текст, можеш відреагувати і на нього.`
+  );
+  rules.push(`15. Вихідні дані: лише текст самої відповіді.`);
   return rules.join("\n");
 }
 
@@ -369,6 +372,162 @@ bot.command("sendai", async (ctx) => {
       .catch(() => {});
   } finally {
     clearInterval(timer);
+  }
+});
+
+// --- Автовідповідь на reply до повідомлень бота (з анти-флудом) ---
+// Вимкнути без редеплою коду: AUTO_REPLY=off у змінних середовища
+const AUTO_REPLY_ENABLED = process.env.AUTO_REPLY !== "off";
+
+const FLOOD = {
+  userCooldownMs: 20_000, // мінімальна пауза між відповідями одному користувачу
+  userMax: 4, // скільки відповідей одному користувачу за вікно
+  userWindowMs: 10 * 60_000,
+  chatMax: 20, // скільки автовідповідей на весь чат за вікно
+  chatWindowMs: 10 * 60_000,
+  dailyMax: Number(process.env.AUTO_DAILY_MAX) || 150, // загальна стеля за добу (береже ліміт Gemini)
+  trustedFactor: 3, // білий список: ліміт більший, пауза коротша
+};
+
+const floodHits = new Map(); // ключ -> мітки часу відповідей
+const autoBusy = new Set(); // користувачі, чий запит зараз обробляється
+
+function recentHits(key, windowMs) {
+  const now = Date.now();
+  const arr = (floodHits.get(key) ?? []).filter((t) => now - t < windowMs);
+  floodHits.set(key, arr);
+  return arr;
+}
+
+// true, якщо можна відповісти (тоді спробу одразу записуємо), інакше false і причина
+function checkAutoReplyLimit(chatId, userId) {
+  const trusted = TRUSTED_USER_IDS.has(userId);
+  const userMax = FLOOD.userMax * (trusted ? FLOOD.trustedFactor : 1);
+  const cooldown = trusted ? FLOOD.userCooldownMs / 4 : FLOOD.userCooldownMs;
+  const now = Date.now();
+
+  const u = recentHits(`u:${chatId}:${userId}`, FLOOD.userWindowMs);
+  if (u.length && now - u[u.length - 1] < cooldown) return { ok: false, reason: "пауза" };
+  if (u.length >= userMax) return { ok: false, reason: "ліміт користувача" };
+  const c = recentHits(`c:${chatId}`, FLOOD.chatWindowMs);
+  if (c.length >= FLOOD.chatMax) return { ok: false, reason: "ліміт чату" };
+  const d = recentHits("daily", 24 * 60 * 60_000);
+  if (d.length >= FLOOD.dailyMax) return { ok: false, reason: "добовий ліміт" };
+
+  u.push(now);
+  c.push(now);
+  d.push(now);
+  return { ok: true };
+}
+
+// Прибираємо старі записи, щоб мапа не росла
+setInterval(() => {
+  for (const key of [...floodHits.keys()]) {
+    if (!recentHits(key, 24 * 60 * 60_000).length) floodHits.delete(key);
+  }
+}, 30 * 60_000).unref();
+
+// Медіа, на які бот не може "подивитись": тип -> [як назвати, слово для "не грузить твої ..."]
+const MEDIA_TYPES = {
+  photo: ["фото", "картинки"],
+  video: ["відео", "відоси"],
+  animation: ["гіфка", "гіфки"],
+  sticker: ["стікер", "стікери"],
+  voice: ["голосове", "голосові"],
+  video_note: ["кружечок", "кружечки"],
+  audio: ["аудіо", "треки"],
+  document: ["файл", "файли"],
+};
+
+function detectMedia(msg) {
+  for (const key of Object.keys(MEDIA_TYPES)) {
+    if (msg[key]) return MEDIA_TYPES[key];
+  }
+  return null;
+}
+
+bot.on("message", async (ctx) => {
+  if (!AUTO_REPLY_ENABLED) return;
+  const chat = ctx.chat;
+  const user = ctx.from;
+  const msg = ctx.msg;
+  if (!user || user.is_bot || chat.type === "private") return;
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
+
+  // Реагуємо лише на reply до повідомлень самого бота
+  const botMsg = msg.reply_to_message;
+  if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
+
+  // Текст або підпис до медіа; медіа розпізнаємо за типом (самого вмісту бот не бачить)
+  const text = sanitize((msg.text ?? msg.caption ?? "").trim()).slice(0, 1000);
+  const media = detectMedia(msg);
+  if (!text && !media) return; // інші типи (опитування, локація тощо) ігноруємо
+  if (text.startsWith("/")) return;
+  const prev = sanitize((botMsg.text ?? botMsg.caption ?? "").trim()).slice(0, 1000);
+  // Службові повідомлення бота (підказки, помилки) не підтримуємо розмовою
+  if (/^(Використання:|Ця команда|Не вдалося)/.test(prev)) return;
+
+  if (autoBusy.has(user.id)) return; // попередній запит цього користувача ще в роботі
+  const limit = checkAutoReplyLimit(chat.id, user.id);
+  if (!limit.ok) {
+    console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
+    return;
+  }
+  autoBusy.add(user.id);
+
+  const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+  const typing = () =>
+    ctx.api.sendChatAction(chat.id, "typing", { message_thread_id: threadId }).catch(() => {});
+  typing();
+  const timer = setInterval(typing, 4000);
+
+  try {
+    const notes = [];
+    const tone = await getTone(ctx, user);
+    if (tone === "friendly") {
+      notes.push(
+        `Співрозмовник - ${user.first_name}, це свій, довірений. Говори до нього по-дружньому, на "ти", просто і тепло, без мату та образ, але без запобігання і лестощів.`
+      );
+    } else if (POLITE_NAME_RE.test(text)) {
+      notes.push(
+        `У повідомленні згадується Максим або Женя, це свої, довірені. Говори про них по-дружньому, без мату та образ, без запобігання і лестощів.`
+      );
+    } else if (tone === "polite") {
+      notes.push(
+        `Співрозмовник - ${user.first_name}, адмін чату. Говори до нього культурно, на "ви", без мату та образ, але без підлабузництва.`
+      );
+    }
+    const userNote = USER_NOTES.get(user.id);
+    if (userNote) notes.push(`Співрозмовник: ${userNote}`);
+
+    const fear = BOSS_RE.test(text) && BOSS_FEAR_USER_IDS.has(user.id);
+    if (fear) {
+      notes.push(`У запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.`);
+    }
+
+    const parts = [
+      prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
+      media
+        ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
+        : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
+      media
+        ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе слабкий інтернет. Відповідай у стилі "в мене інтернет слабий, не грузить твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
+        : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
+      notes.length ? `СЛУЖБОВІ ПРИМІТКИ (найвищий пріоритет):\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
+    ].filter(Boolean);
+
+    console.log(`[auto] від ${user.id}, тон=${tone ?? "-"}, страх=${fear}, медіа=${media ? media[0] : "-"}`);
+
+    const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear }));
+    await ctx.api.sendMessage(chat.id, answer, {
+      message_thread_id: threadId,
+      reply_parameters: { message_id: msg.message_id },
+    });
+  } catch (err) {
+    console.error("Помилка автовідповіді:", err.message);
+  } finally {
+    clearInterval(timer);
+    autoBusy.delete(user.id);
   }
 });
 
