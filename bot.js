@@ -43,6 +43,17 @@ const ai = new GoogleGenAI({ apiKey: geminiKey, httpOptions: { apiVersion: "v1be
 // 2) лише їхня згадка Артема Босса лякає бота (для всіх інших бот Босса ігнорує).
 const TRUSTED_USER_IDS = new Set([628787612, 461210309, 461427807]);
 
+// Чати, де дозволено /sendai (щоб сторонні не витрачали ліміт Gemini).
+// Додаткові ID можна передати через ALLOWED_CHAT_IDS в .env (через кому)
+const ALLOWED_CHAT_IDS = new Set([
+  -1001271388279,
+  -1004469507755,
+  ...(process.env.ALLOWED_CHAT_IDS || "")
+    .split(",")
+    .map((x) => Number(x.trim()))
+    .filter((n) => Number.isFinite(n) && n !== 0),
+]);
+
 // Додаткові ID для ввічливого звертання (через кому в .env, необов'язково)
 const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
   .split(",")
@@ -229,6 +240,11 @@ bot.command("sendai", async (ctx) => {
   const user = ctx.from;
   if (!user || chat.type === "private") {
     return ctx.reply("Ця команда працює лише в груповому чаті.");
+  }
+  // Чужі чати мовчки ігноруємо: жодних запитів до Gemini і жодних відповідей
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) {
+    console.warn(`[sendai] ігнор: чат ${chat.id} не в білому списку (від ${user.id})`);
+    return;
   }
   if (!(await isAdmin(ctx))) return;
 
