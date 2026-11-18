@@ -457,12 +457,12 @@ bot.command("aggression", (ctx) =>
 const AUTO_REPLY_ENABLED = process.env.AUTO_REPLY !== "off";
 
 const FLOOD = {
-  userCooldownMs: 20_000, // мінімальна пауза між відповідями одному користувачу
-  userMax: 4, // скільки відповідей одному користувачу за вікно
+  userCooldownMs: 8_000, // мінімальна пауза між відповідями одному користувачу
+  userMax: 10, // скільки відповідей одному користувачу за вікно
   userWindowMs: 10 * 60_000,
-  chatMax: 20, // скільки автовідповідей на весь чат за вікно
+  chatMax: 50, // скільки автовідповідей на весь чат за вікно
   chatWindowMs: 10 * 60_000,
-  dailyMax: Number(process.env.AUTO_DAILY_MAX) || 150, // загальна стеля за добу (береже ліміт Gemini)
+  dailyMax: Number(process.env.AUTO_DAILY_MAX) || 375, // загальна стеля за добу (береже ліміт Gemini)
   trustedFactor: 3, // білий список: ліміт більший, пауза коротша
 };
 
