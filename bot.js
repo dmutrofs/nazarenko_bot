@@ -72,11 +72,18 @@ const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu; // Артем
 // Згадка Максима або Жені за іменем у тексті (щоб бот був ввічливий, коли про них пишуть)
 const POLITE_NAME_RE = /(?<!\p{L})(?:максим\p{L}*|maxim\p{L}*|жен(?:я|і|ю|єю|ьк\p{L}*))(?!\p{L})/iu;
 
+// Пункт 1 системного промпта залежить від рівня агресії (команда /aggression): 0, 1 або 2
+const STYLE_RULES = {
+  0: `1. Стиль за замовчуванням: добрий, привітний і чемний до всіх, без нецензурної лексики і образ. Якщо до тебе ставляться чемно, відповідай ще чемніше і тепло. Якщо хтось хамить, можеш спокійно, з іронією поставити його на місце, але без мату.`,
+  1: `1. Стиль за замовчуванням: агресивний, зневажливий, грубий, з нецензурною лексикою.`,
+  2: `1. Стиль за замовчуванням: дуже злий, набагато агресивніший за звичайний: різкий, зневажливий, максимально грубий, з рясною нецензурною лексикою, жорстко принижуй і висміюй співрозмовника по суті сказаного. Це не скасовує пункти 3, 4, 5, 6, 7, 8.`,
+};
+
 // Правила, що не залежать від адресата. Пункт про Босса додається окремо (див. buildSystemPrompt)
-function buildSystemPrompt({ fear }) {
+function buildSystemPrompt({ fear, aggression = 1 }) {
   const rules = [
     `Ти учасник українського чату. Відповідай за такими правилами:`,
-    `1. Стиль за замовчуванням: агресивний, зневажливий, грубий, з нецензурною лексикою.`,
+    STYLE_RULES[aggression] ?? STYLE_RULES[1],
     `2. Мова: українська, з діалектизмами Житомирщини (околиці Бердичева): "шо", "чьо", "тіко", "ото", "тута", "шоб" та подібні розмовні форми.`,
     `3. Заборонено використовувати довге тире "—". Користуйся лише комою, крапкою або звичайним дефісом "-".`,
     `4. Кожне речення-питання має закінчуватися саме на "?!!!" замість звичайного "?".`,
@@ -365,7 +372,7 @@ bot.command("sendai", async (ctx) => {
       `[sendai] від ${user.id}, reply до ${replied?.from?.id ?? "-"}, ввічливо=${polite}, страх=${bossMentionedByTrusted}`
     );
 
-    const answer = await askGemini(prompt, buildSystemPrompt({ fear: bossMentionedByTrusted }));
+    const answer = await askGemini(prompt, buildSystemPrompt({ fear: bossMentionedByTrusted, aggression: botState.aggression }));
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: replied ? { message_id: replied.message_id } : undefined,
@@ -380,6 +387,70 @@ bot.command("sendai", async (ctx) => {
     clearInterval(timer);
   }
 });
+
+// --- Адмінські команди налаштування бота ---
+// Стан живе в пам'яті процесу: після перезапуску на Render повертається до значень за замовчуванням
+const botState = {
+  asleep: false, // /sleepvova, /upvova: вимкнено/увімкнено автовідповідь на reply
+  aggression: 1, // /aggression 0|1|2
+};
+
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+const SLEEP_LINES = ["Усе, йду спати", "Усе, пішов спати, не будіть", "Ну шо, я тіко спатки, на добраніч"];
+const WAKE_LINES = ["Я вернувся, розказуйте шось", "Ото я вже тута, розказуйте шо в вас"];
+const AGGRESSION_LINES = {
+  0: ["Сьогодні увесь би світ розцілував", "Ой, шось я сьогодні добрий, усіх би обійняв"],
+  1: ["Що в нас тут робиться!???"],
+  2: ["Не лізьте під гарячу руку", "Ото тіко спробуйте шось ляпнути, не лізьте під гарячу руку"],
+};
+
+// Спільна обгортка: лише дозволені чати й адміни, команда одразу зникає з чату
+async function adminControl(ctx, handler) {
+  const chat = ctx.chat;
+  const user = ctx.from;
+  if (!user || chat.type === "private") {
+    return ctx.reply("Ця команда працює лише в груповому чаті.");
+  }
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
+  if (!(await isAdmin(ctx))) return;
+
+  const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
+  await ctx.deleteMessage().catch(() => {}); // потрібне право «Видаляти повідомлення»
+  const say = (text) => ctx.api.sendMessage(chat.id, text, { message_thread_id: threadId });
+  await handler({ say, threadId, chat });
+}
+
+bot.command("sleepvova", (ctx) =>
+  adminControl(ctx, async ({ say }) => {
+    botState.asleep = true;
+    console.log(`[admin] ${ctx.from.id}: Вова спить (автовідповідь вимкнено)`);
+    await say(pick(SLEEP_LINES));
+  })
+);
+
+bot.command("upvova", (ctx) =>
+  adminControl(ctx, async ({ say }) => {
+    botState.asleep = false;
+    console.log(`[admin] ${ctx.from.id}: Вова прокинувся (автовідповідь увімкнено)`);
+    await say(pick(WAKE_LINES));
+  })
+);
+
+bot.command("aggression", (ctx) =>
+  adminControl(ctx, async ({ say, chat }) => {
+    const arg = ctx.match.trim();
+    if (!["0", "1", "2"].includes(arg)) {
+      // Підказку показуємо на кілька секунд і прибираємо, щоб не смітити в чаті
+      const hint = await say(`Використання: /aggression <0-2> (зараз: ${botState.aggression})`);
+      setTimeout(() => ctx.api.deleteMessage(chat.id, hint.message_id).catch(() => {}), 8000);
+      return;
+    }
+    botState.aggression = Number(arg);
+    console.log(`[admin] ${ctx.from.id}: рівень агресії ${botState.aggression}`);
+    await say(pick(AGGRESSION_LINES[botState.aggression]));
+  })
+);
 
 // --- Автовідповідь на reply до повідомлень бота (з анти-флудом) ---
 // Вимкнути без редеплою коду: AUTO_REPLY=off у змінних середовища
@@ -453,7 +524,7 @@ function detectMedia(msg) {
 }
 
 bot.on("message", async (ctx) => {
-  if (!AUTO_REPLY_ENABLED) return;
+  if (!AUTO_REPLY_ENABLED || botState.asleep) return;
   const chat = ctx.chat;
   const user = ctx.from;
   const msg = ctx.msg;
@@ -524,7 +595,7 @@ bot.on("message", async (ctx) => {
 
     console.log(`[auto] від ${user.id}, тон=${tone ?? "-"}, страх=${fear}, медіа=${media ? media[0] : "-"}`);
 
-    const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear }));
+    const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear, aggression: botState.aggression }));
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: { message_id: msg.message_id },
