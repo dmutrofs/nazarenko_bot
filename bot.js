@@ -171,13 +171,13 @@ const GEMINI_TIMEOUT_MS = 25_000; // на одну модель
 const COOLDOWN_MS = 5 * 60_000; // скільки пропускати модель після збою
 
 // Тон до адресата: "friendly" для білого списку, "polite" для адміна чату, null для решти
-async function getTone(ctx, u) {
+async function getTone(api, chatId, u) {
   if (u.is_bot) return null;
   if (TRUSTED_USER_IDS.has(u.id) || POLITE_USER_IDS.includes(String(u.id))) return "friendly";
   const label = [u.first_name, u.last_name, u.username].filter(Boolean).join(" ");
   if (/максим|maxim/i.test(label)) return "friendly";
   try {
-    const member = await ctx.getChatMember(u.id);
+    const member = await api.getChatMember(chatId, u.id);
     return ["creator", "administrator"].includes(member.status) ? "polite" : null;
   } catch {
     return null;
@@ -285,12 +285,13 @@ bot.command("send", async (ctx) => {
   const repliedMsg = getRepliedMessage(ctx, threadId);
   const replyTo = repliedMsg?.message_id;
 
-  startBotChain(chat.id, "vova", repliedMsg);
+  const gen = startBotChain(chat.id, "vova", repliedMsg);
 
-  await ctx.api.sendMessage(chat.id, text, {
+  const sent = await ctx.api.sendMessage(chat.id, text, {
     message_thread_id: threadId,
     reply_parameters: replyTo ? { message_id: replyTo } : undefined,
   });
+  relayBotChain(chat.id, "vova", sent, gen); // reply на Віталю: він відповість
 
   // Прибираємо саму команду (потрібне право «Видаляти повідомлення»)
   await ctx.deleteMessage().catch(() => {});
@@ -342,7 +343,7 @@ bot.command("sendai", async (ctx) => {
     let tone = null;
     let toneName;
     for (const u of [replied?.from, ...mentionedUsers].filter(Boolean)) {
-      const t = await getTone(ctx, u);
+      const t = await getTone(ctx.api, chat.id, u);
       if (t && (!tone || t === "friendly")) {
         tone = t;
         toneName = u.first_name;
@@ -405,11 +406,12 @@ bot.command("sendai", async (ctx) => {
     );
 
     const answer = await askGemini(prompt, buildSystemPrompt({ fear: bossMentionedByTrusted, aggression: botState.aggression }));
-    startBotChain(chat.id, "vova", replied);
-    await ctx.api.sendMessage(chat.id, answer, {
+    const gen = startBotChain(chat.id, "vova", replied);
+    const sent = await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: replied ? { message_id: replied.message_id } : undefined,
     });
+    relayBotChain(chat.id, "vova", sent, gen);
   } catch (err) {
     console.error("Помилка /sendai:", err);
     // Команду вже видалено, тож повідомляємо адміна в особисті (спрацює, якщо він писав боту /start)
@@ -431,40 +433,83 @@ const botState = {
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Захист від зациклення між двома ботами ---
-// Максимум BOT_CHAIN_MAX повідомлень від кожного бота в одній "розмові" в чаті.
+// --- Bot-to-bot: розмова Вови і Віталі ---
+// Telegram не доставляє ботам повідомлення інших ботів, тому розмову ведемо всередині процесу:
+// щойно один бот надіслав reply на повідомлення іншого, relayBotChain передає хід іншому боту.
 // Розмова починається, коли адмін командою (/send, /sendai, /sendst, /sendaist) пише від імені
-// одного бота у відповідь на повідомлення іншого. Лічильник скидається, коли втручається людина
-// (reply до бота) або після BOT_CHAIN_IDLE_MS тиші.
+// одного бота у відповідь на повідомлення іншого. Ліміт: BOT_CHAIN_MAX повідомлень на кожного бота.
+// Нова команда адміна в тому самому чаті обриває попередню розмову (інший gen).
 const BOT_CHAIN_MAX = 7;
 const BOT_CHAIN_IDLE_MS = 10 * 60_000;
-const botChains = new Map(); // chatId -> { vova, st, last }
+const botChainDelay = () => 3000 + Math.random() * 3000; // пауза, щоб розмова не йшла блискавично
+const botChains = new Map(); // chatId -> { vova, st, gen, last }
+let chainSeq = 0;
 
-function chainGet(chatId) {
-  const now = Date.now();
-  let c = botChains.get(chatId);
-  if (!c || now - c.last > BOT_CHAIN_IDLE_MS) {
-    c = { vova: 0, st: 0, last: now };
-    botChains.set(chatId, c);
-  }
-  return c;
+function chainActive(chatId, gen) {
+  const c = botChains.get(chatId);
+  return Boolean(c) && c.gen === gen && Date.now() - c.last <= BOT_CHAIN_IDLE_MS;
 }
-const chainAllows = (chatId, who) => chainGet(chatId)[who] < BOT_CHAIN_MAX;
+const chainAllows = (chatId, who) => (botChains.get(chatId)?.[who] ?? 0) < BOT_CHAIN_MAX;
 function chainCount(chatId, who) {
-  const c = chainGet(chatId);
+  const c = botChains.get(chatId);
+  if (!c) return;
   c[who]++;
   c.last = Date.now();
 }
-function chainReset(chatId) {
-  botChains.set(chatId, { vova: 0, st: 0, last: Date.now() });
-}
-// Команда адміна відповідає на повідомлення іншого бота: нова розмова, це повідомлення рахуємо як перше
+
+// Команда адміна відповідає на повідомлення іншого бота: нова розмова, це повідомлення рахуємо як перше.
+// Повертає gen розмови або null, якщо це не reply на іншого бота
 function startBotChain(chatId, who, replied) {
   const otherId = who === "vova" ? ST_BOT_ID : VOVA_BOT_ID;
-  if (replied?.from?.id !== otherId) return;
-  chainReset(chatId);
+  if (replied?.from?.id !== otherId) return null;
+  const gen = ++chainSeq;
+  botChains.set(chatId, { vova: 0, st: 0, gen, last: Date.now() });
   chainCount(chatId, who);
+  console.log(`[chain] чат ${chatId}: нова розмова ботів #${gen}, почав ${who}`);
+  return gen;
 }
+
+// Бот `who` надіслав `sent` у відповідь на повідомлення іншого бота: інший бот відповідає,
+// потім знову перший і так далі, поки кожен не вичерпає BOT_CHAIN_MAX
+function relayBotChain(chatId, who, sent, gen) {
+  if (!gen || !sent?.reply_to_message) return;
+  const other = who === "vova" ? "st" : "vova";
+  const api = other === "vova" ? bot.api : botSt.api;
+  const reply = other === "vova" ? vovaReply : stReply;
+  const threadId = sent.is_topic_message ? sent.message_thread_id : undefined;
+
+  (async () => {
+    await sleep(botChainDelay());
+    if (!chainActive(chatId, gen)) return; // нова розмова або довга тиша
+    if (!AUTO_REPLY_ENABLED || (other === "vova" ? botState.asleep : stState.asleep)) return;
+    if (!chainAllows(chatId, other)) {
+      console.log(`[chain] #${gen}: ${other} вичерпав ліміт ${BOT_CHAIN_MAX}, розмову завершено`);
+      return;
+    }
+    chainCount(chatId, other); // рахуємо до запиту, щоб не було перегонів
+    const answered = await withTyping(api, chatId, threadId, () =>
+      reply({ api, chatId, msg: sent, botMsg: sent.reply_to_message, user: sent.from, fromOtherBot: true })
+    );
+    relayBotChain(chatId, other, answered, gen);
+  })().catch((err) => console.error(`[chain] #${gen}: помилка (${other}):`, err.message));
+}
+
+// Показує "друкує..." поки виконується fn
+async function withTyping(api, chatId, threadId, fn) {
+  const typing = () =>
+    api.sendChatAction(chatId, "typing", { message_thread_id: threadId }).catch(() => {});
+  typing();
+  const timer = setInterval(typing, 4000);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+const msgText = (m) => sanitize((m?.text ?? m?.caption ?? "").trim()).slice(0, 1000);
+// Службові повідомлення бота (підказки, помилки) не підтримуємо розмовою
+const isServiceMsg = (m) => /^(Використання:|Ця команда|Не вдалося)/.test(msgText(m));
 
 const SLEEP_LINES = ["Усе, йду спати", "Усе, пішов спати, не будіть", "Ну шо, я тіко спатки, на добраніч"];
 const WAKE_LINES = ["Я вернувся, розказуйте шось", "Ото я вже тута, розказуйте шо в вас"];
@@ -594,104 +639,96 @@ function detectMedia(msg) {
   return null;
 }
 
+// Генерує і надсилає відповідь Вови на msg (reply до його повідомлення botMsg).
+// Спільна для автовідповіді людям і для розмови з Віталею (fromOtherBot)
+async function vovaReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
+  const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+  // Текст або підпис до медіа; медіа розпізнаємо за типом (самого вмісту бот не бачить)
+  const text = msgText(msg);
+  const media = detectMedia(msg);
+  const prev = msgText(botMsg);
+
+  const notes = [];
+  if (fromOtherBot) {
+    notes.push(`Співрозмовник - Віталя Сторожук з Любара, твій головний ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
+  }
+  const tone = fromOtherBot ? null : await getTone(api, chatId, user);
+  if (tone === "friendly") {
+    notes.push(
+      `Співрозмовник - ${user.first_name}, це свій, довірений. Говори до нього по-дружньому, на "ти", просто і тепло, без мату та образ, але без запобігання і лестощів.`
+    );
+  } else if (POLITE_NAME_RE.test(text)) {
+    notes.push(
+      `У повідомленні згадується Максим або Женя, це свої, довірені. Говори про них по-дружньому, без мату та образ, без запобігання і лестощів.`
+    );
+  } else if (tone === "polite") {
+    notes.push(
+      `Співрозмовник - ${user.first_name}, адмін чату. Говори до нього культурно, на "ви", без мату та образ, але без підлабузництва.`
+    );
+  }
+  const userNote = !fromOtherBot && USER_NOTES.get(user.id);
+  if (userNote) notes.push(`Співрозмовник: ${userNote}`);
+
+  const fear = !fromOtherBot && BOSS_RE.test(text) && BOSS_FEAR_USER_IDS.has(user.id);
+  if (fear) {
+    notes.push(`У запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.`);
+  }
+
+  const parts = [
+    prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
+    media
+      ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
+      : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
+    media
+      ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе слабкий інтернет. Відповідай у стилі "в мене інтернет слабий, не грузить твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
+      : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
+    notes.length ? `СЛУЖБОВІ ПРИМІТКИ (найвищий пріоритет):\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
+  ].filter(Boolean);
+
+  console.log(`[auto] від ${user.id}, бот=${fromOtherBot}, тон=${tone ?? "-"}, страх=${fear}, медіа=${media ? media[0] : "-"}`);
+
+  const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear, aggression: botState.aggression }));
+  return api.sendMessage(chatId, answer, {
+    message_thread_id: threadId,
+    reply_parameters: { message_id: msg.message_id },
+  });
+}
+
+// Автовідповідь людям. Повідомлення ботів (зокрема Віталі) тут ігноруємо:
+// розмову ботів веде relayBotChain всередині процесу, тож дублів не буде
 bot.on("message", async (ctx) => {
   if (!AUTO_REPLY_ENABLED || botState.asleep) return;
   const chat = ctx.chat;
   const user = ctx.from;
   const msg = ctx.msg;
-  const fromOtherBot = Boolean(user?.is_bot) && user.id === ST_BOT_ID; // Вова приймає ботів лише від Віталі
-  if (!user || (user.is_bot && !fromOtherBot) || chat.type === "private") return;
+  if (!user || user.is_bot || chat.type === "private") return;
   if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
 
   // Реагуємо лише на reply до повідомлень самого бота
   const botMsg = msg.reply_to_message;
   if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
-  if (fromOtherBot && !chainAllows(chat.id, "st")) {
-    console.log(`[st] ліміт ${BOT_CHAIN_MAX} повідомлень у розмові з іншим ботом, мовчу`);
-    return;
-  }
-  if (fromOtherBot && !chainAllows(chat.id, "vova")) {
-    console.log(`[auto] ліміт ${BOT_CHAIN_MAX} повідомлень у розмові з іншим ботом, мовчу`);
-    return;
-  }
 
-  // Текст або підпис до медіа; медіа розпізнаємо за типом (самого вмісту бот не бачить)
-  const text = sanitize((msg.text ?? msg.caption ?? "").trim()).slice(0, 1000);
-  const media = detectMedia(msg);
-  if (!text && !media) return; // інші типи (опитування, локація тощо) ігноруємо
+  const text = msgText(msg);
+  if (!text && !detectMedia(msg)) return; // інші типи (опитування, локація тощо) ігноруємо
   if (text.startsWith("/")) return;
-  const prev = sanitize((botMsg.text ?? botMsg.caption ?? "").trim()).slice(0, 1000);
-  // Службові повідомлення бота (підказки, помилки) не підтримуємо розмовою
-  if (/^(Використання:|Ця команда|Не вдалося)/.test(prev)) return;
+  if (isServiceMsg(botMsg)) return;
 
   if (autoBusy.has(user.id)) return; // попередній запит цього користувача ще в роботі
-  if (!fromOtherBot) {
-    const limit = checkAutoReplyLimit(chat.id, user.id);
-    if (!limit.ok) {
-      console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
-      return;
-    }
-    chainReset(chat.id); // втрутилась людина: нова розмова
+  const limit = checkAutoReplyLimit(chat.id, user.id);
+  if (!limit.ok) {
+    console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
+    return;
   }
   autoBusy.add(user.id);
 
   const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
-  const typing = () =>
-    ctx.api.sendChatAction(chat.id, "typing", { message_thread_id: threadId }).catch(() => {});
-  typing();
-  const timer = setInterval(typing, 4000);
-
   try {
-    const notes = [];
-    if (fromOtherBot) {
-      notes.push(`Співрозмовник - Віталя Сторожук з Любара, твій головний ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
-    }
-    const tone = await getTone(ctx, user);
-    if (tone === "friendly") {
-      notes.push(
-        `Співрозмовник - ${user.first_name}, це свій, довірений. Говори до нього по-дружньому, на "ти", просто і тепло, без мату та образ, але без запобігання і лестощів.`
-      );
-    } else if (POLITE_NAME_RE.test(text)) {
-      notes.push(
-        `У повідомленні згадується Максим або Женя, це свої, довірені. Говори про них по-дружньому, без мату та образ, без запобігання і лестощів.`
-      );
-    } else if (tone === "polite") {
-      notes.push(
-        `Співрозмовник - ${user.first_name}, адмін чату. Говори до нього культурно, на "ви", без мату та образ, але без підлабузництва.`
-      );
-    }
-    const userNote = USER_NOTES.get(user.id);
-    if (userNote) notes.push(`Співрозмовник: ${userNote}`);
-
-    const fear = BOSS_RE.test(text) && BOSS_FEAR_USER_IDS.has(user.id);
-    if (fear) {
-      notes.push(`У запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.`);
-    }
-
-    const parts = [
-      prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
-      media
-        ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
-        : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
-      media
-        ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе слабкий інтернет. Відповідай у стилі "в мене інтернет слабий, не грузить твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
-        : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
-      notes.length ? `СЛУЖБОВІ ПРИМІТКИ (найвищий пріоритет):\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
-    ].filter(Boolean);
-
-    console.log(`[auto] від ${user.id}, тон=${tone ?? "-"}, страх=${fear}, медіа=${media ? media[0] : "-"}`);
-
-    if (fromOtherBot) await sleep(3000 + Math.random() * 3000); // пауза, щоб розмова ботів не йшла блискавично
-    const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear, aggression: botState.aggression }));
-    await ctx.api.sendMessage(chat.id, answer, {
-      message_thread_id: threadId,
-      reply_parameters: { message_id: msg.message_id },
-    });
-    if (fromOtherBot) chainCount(chat.id, "vova");
+    await withTyping(ctx.api, chat.id, threadId, () =>
+      vovaReply({ api: ctx.api, chatId: chat.id, msg, botMsg, user, fromOtherBot: false })
+    );
   } catch (err) {
     console.error("Помилка автовідповіді:", err.message);
   } finally {
-    clearInterval(timer);
     autoBusy.delete(user.id);
   }
 });
@@ -785,12 +822,13 @@ botSt.command("sendst", async (ctx) => {
   const repliedMsg = getRepliedMessage(ctx, threadId);
   const replyTo = repliedMsg?.message_id;
 
-  startBotChain(chat.id, "st", repliedMsg);
+  const gen = startBotChain(chat.id, "st", repliedMsg);
 
-  await ctx.api.sendMessage(chat.id, text, {
+  const sent = await ctx.api.sendMessage(chat.id, text, {
     message_thread_id: threadId,
     reply_parameters: replyTo ? { message_id: replyTo } : undefined,
   });
+  relayBotChain(chat.id, "st", sent, gen); // reply на Вову: він відповість
   await ctx.deleteMessage().catch(() => {});
 });
 
@@ -857,11 +895,12 @@ botSt.command("sendaist", async (ctx) => {
     console.log(`[st] /sendaist від ${user.id}, reply до ${replied?.from?.id ?? "-"}`);
 
     const answer = await askVitalya(parts.join("\n\n"));
-    startBotChain(chat.id, "st", replied);
-    await ctx.api.sendMessage(chat.id, answer, {
+    const gen = startBotChain(chat.id, "st", replied);
+    const sent = await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: replied ? { message_id: replied.message_id } : undefined,
     });
+    relayBotChain(chat.id, "st", sent, gen);
   } catch (err) {
     console.error("Помилка /sendaist:", err);
     await ctx.api
@@ -899,74 +938,74 @@ botSt.command("upst", (ctx) =>
 );
 
 // --- Автовідповідь Віталі на reply до його повідомлень (з анти-флудом) ---
+// Генерує і надсилає відповідь Віталі на msg (reply до його повідомлення botMsg).
+// Спільна для автовідповіді людям і для розмови з Вовою (fromOtherBot)
+async function stReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
+  const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+  const text = msgText(msg);
+  const media = detectMedia(msg);
+  const prev = msgText(botMsg);
+
+  const notes = [];
+  if (fromOtherBot) {
+    notes.push(`Співрозмовник - Вова Назаренко, старший з Кличків, твій ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
+  }
+  const enemyNote = stEnemyNote(user, "Співрозмовник");
+  if (enemyNote) notes.push(enemyNote);
+
+  const parts = [
+    prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
+    media
+      ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
+      : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
+    media
+      ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе поганий інтернет. Відповідай на кшталт "шо ти кидаєш в мене інет не тягне ці твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
+      : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
+    notes.length ? `СЛУЖБОВІ ПРИМІТКИ:\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
+  ].filter(Boolean);
+
+  console.log(`[st] автовідповідь для ${user.id}, бот=${fromOtherBot}, ворог=${Boolean(enemyNote)}, медіа=${media ? media[0] : "-"}`);
+
+  const answer = await askVitalya(parts.join("\n\n"));
+  return api.sendMessage(chatId, answer, {
+    message_thread_id: threadId,
+    reply_parameters: { message_id: msg.message_id },
+  });
+}
+
+// Автовідповідь людям. Повідомлення ботів ігноруємо: розмову з Вовою веде relayBotChain
 botSt.on("message", async (ctx) => {
   if (!AUTO_REPLY_ENABLED || stState.asleep) return;
   const chat = ctx.chat;
   const user = ctx.from;
   const msg = ctx.msg;
-  const fromOtherBot = Boolean(user?.is_bot) && user.id === VOVA_BOT_ID; // Віталя приймає ботів лише від Вови
-  if (!user || (user.is_bot && !fromOtherBot) || chat.type === "private") return;
+  if (!user || user.is_bot || chat.type === "private") return;
   if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
 
   const botMsg = msg.reply_to_message;
   if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
 
-  const text = sanitize((msg.text ?? msg.caption ?? "").trim()).slice(0, 1000);
-  const media = detectMedia(msg);
-  if (!text && !media) return;
+  const text = msgText(msg);
+  if (!text && !detectMedia(msg)) return;
   if (text.startsWith("/")) return;
-  const prev = sanitize((botMsg.text ?? botMsg.caption ?? "").trim()).slice(0, 1000);
-  if (/^(Використання:|Ця команда|Не вдалося)/.test(prev)) return;
+  if (isServiceMsg(botMsg)) return;
 
   if (autoBusySt.has(user.id)) return;
-  if (!fromOtherBot) {
-    const limit = checkAutoReplyLimit(chat.id, user.id, "st");
-    if (!limit.ok) {
-      console.log(`[st] ігнор від ${user.id}: ${limit.reason}`);
-      return;
-    }
-    chainReset(chat.id); // втрутилась людина: нова розмова
+  const limit = checkAutoReplyLimit(chat.id, user.id, "st");
+  if (!limit.ok) {
+    console.log(`[st] ігнор від ${user.id}: ${limit.reason}`);
+    return;
   }
   autoBusySt.add(user.id);
 
   const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
-  const typing = () =>
-    ctx.api.sendChatAction(chat.id, "typing", { message_thread_id: threadId }).catch(() => {});
-  typing();
-  const timer = setInterval(typing, 4000);
-
   try {
-    const notes = [];
-    if (fromOtherBot) {
-      notes.push(`Співрозмовник - Вова Назаренко, старший з Кличків, твій ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
-    }
-    const enemyNote = stEnemyNote(user, "Співрозмовник");
-    if (enemyNote) notes.push(enemyNote);
-
-    const parts = [
-      prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
-      media
-        ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
-        : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
-      media
-        ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе поганий інтернет. Відповідай на кшталт "шо ти кидаєш в мене інет не тягне ці твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
-        : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
-      notes.length ? `СЛУЖБОВІ ПРИМІТКИ:\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
-    ].filter(Boolean);
-
-    console.log(`[st] автовідповідь для ${user.id}, ворог=${Boolean(enemyNote)}, медіа=${media ? media[0] : "-"}`);
-
-    if (fromOtherBot) await sleep(3000 + Math.random() * 3000); // пауза, щоб розмова ботів не йшла блискавично
-    const answer = await askVitalya(parts.join("\n\n"));
-    await ctx.api.sendMessage(chat.id, answer, {
-      message_thread_id: threadId,
-      reply_parameters: { message_id: msg.message_id },
-    });
-    if (fromOtherBot) chainCount(chat.id, "st");
+    await withTyping(ctx.api, chat.id, threadId, () =>
+      stReply({ api: ctx.api, chatId: chat.id, msg, botMsg, user, fromOtherBot: false })
+    );
   } catch (err) {
     console.error("Помилка автовідповіді Віталі:", err.message);
   } finally {
-    clearInterval(timer);
     autoBusySt.delete(user.id);
   }
 });
