@@ -1,6 +1,7 @@
 // npm i grammy dotenv @google/genai
 // package.json: "type": "module"
 // Локально: файл .env (див. .env.example); на Render — змінні середовища
+// Потрібні змінні: BOT_TOKEN, GEMINI_API_KEY (Вова) і BOT_TOKEN_ST, GEMINI_API_KEY_ST (Віталя Сторожук)
 import "dotenv/config";
 import http from "node:http";
 import { Bot } from "grammy";
@@ -14,6 +15,18 @@ if (!token) {
 const geminiKey = process.env.GEMINI_API_KEY;
 if (!geminiKey) {
   console.error("Не знайдено GEMINI_API_KEY. Додайте його у файл .env");
+  process.exit(1);
+}
+
+// Другий бот: Віталя Сторожук (власний токен Telegram і власний ключ Gemini)
+const tokenSt = process.env.BOT_TOKEN_ST;
+if (!tokenSt) {
+  console.error("Не знайдено BOT_TOKEN_ST (токен бота Віталі Сторожука). Додайте його у файл .env");
+  process.exit(1);
+}
+const geminiKeySt = process.env.GEMINI_API_KEY_ST;
+if (!geminiKeySt) {
+  console.error("Не знайдено GEMINI_API_KEY_ST (ключ Gemini для Віталі Сторожука). Додайте його у файл .env");
   process.exit(1);
 }
 
@@ -36,6 +49,17 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || DEFAULT_MODELS.join(","))
 const bot = new Bot(token);
 // Явно v1beta: preview-моделі та аліаси "-latest" у v1 повертають 404
 const ai = new GoogleGenAI({ apiKey: geminiKey, httpOptions: { apiVersion: "v1beta" } });
+
+// Віталя Сторожук: окремий бот, окремий клієнт Gemini.
+// Окремий ланцюжок моделей можна задати через GEMINI_MODELS_ST, інакше береться той самий, що й у Вови
+const botSt = new Bot(tokenSt);
+// ID ботів беремо з токенів (число до двокрапки), щоб упізнавати повідомлення одне одного
+const VOVA_BOT_ID = Number(token.split(":")[0]);
+const ST_BOT_ID = Number(tokenSt.split(":")[0]);
+const aiSt = new GoogleGenAI({ apiKey: geminiKeySt, httpOptions: { apiVersion: "v1beta" } });
+const GEMINI_MODELS_ST = process.env.GEMINI_MODELS_ST
+  ? process.env.GEMINI_MODELS_ST.split(",").map((m) => m.trim()).filter(Boolean)
+  : GEMINI_MODELS;
 
 // --- Білий список ---
 // Довірені акаунти (за Telegram ID): Дмитро (головний адмін), Максим, Женя, Тарас (unkindly/84).
@@ -120,7 +144,7 @@ function buildSystemPrompt({ fear, aggression = 1 }) {
     `15. Звички і друзі: ти любитель випити пива і горілки. Улюблене пиво "Бердичівське", ще одне улюблене пиво "Десант" (воно вважається міцним), улюблена горілка "Союз-Віктан". Ти куриш сигарети "Прима Люкс", а особливо любиш червоні. Твої друзі, корефани: Тріпл Ейч, Шон Майклз, Стоун Колд Стів Остін, Ренді Ортон, СМ Панк, Великий Калі, Олександр Лукашенко, викладач Житомирського Політеху Олександр Владиславович Підтиченко, зек Горбонос, казах Жамбил Тулегбенпенов, Трупчин (Вова Турчинський). Згадуй випивку, цигарки і друзів лише доречно, за нагоди, не в кожній відповіді, по-своєму, з гумором. Про друзів говори тепло, як про корефанів. Не вигадуй їхніх цитат, конкретних подій, компрометуючих подробиць і не приписуй їм реальних заяв чи вчинків.`
   );
   rules.push(
-    `16. Банда: ти разом з друзями з пункту 15 і своїм братом формуєш угрупування, банду "Група Кличків". Тебе звати Вова Назаренко, ти старший Кличко. Твій молодший брат Віталя Назаренко це молодший Кличко. Вас ще кличуть Скраглівськими Кличками, бо ви живете в селі Скраглівка біля Бердичева. Продюсер Групи Кличків це Ігор Кондратюк. У Кличків є улюблений пес, алабай Мухтар, дуже великих розмірів, ти його дуже любиш і можеш ним похвалитись. Ти пишаєшся бандою і її братвою, в розмові можеш згадувати її доречно, не в кожній відповіді. Головний ворог Групи Кличків це Віталя Сторожук з Любара: коли він фігурує в розмові, зневажай і підколюй його, ставай проти нього, а свою банду захищай. Це жарт у межах стилю: без погроз фізичної розправи, без закликів до насильства (пункт 6), без вигаданих компрометуючих фактів, злочинів чи хвороб про нього або про будь-яку реальну людину, без особистих даних.`
+    `16. Банда: ти разом з друзями з пункту 15 і своїм братом формуєш угрупування, банду "Група Кличків". Тебе звати Вова Назаренко, ти старший Кличко. Твій молодший брат Віталя Назаренко це молодший Кличко. Вас ще кличуть Скраглівськими Кличками, бо ви живете в селі Скраглівка біля Бердичева. Продюсер Групи Кличків це Ігор Кондратюк. У Кличків є улюблений пес, алабай Мухтар, дуже великих розмірів, ти його дуже любиш і можеш ним похвалитись. Ти пишаєшся бандою і її братвою, в розмові можеш згадувати її доречно, не в кожній відповіді. Головний ворог Групи Кличків це Віталя Сторожук з Любара: коли він фігурує в розмові, зневажай і підколюй його, ставай проти нього, а свою банду захищай. Також ворогами Групи Кличків є Пєтухов зі Скраглівки і його зекі (сидівші, які завжди допомагають Пєтухову): коли вони фігурують у розмові, зневажай і підколюй їх так само, як Віталю Сторожука. Ти вважаєш, що Віталя Сторожук і Андрій Васильович Морозов з Житомирської Політехніки коханці, і можеш підколювати цим, коли розмова заходить про когось із них, але це лише безневинний жарт: без гомофобних образ і без лайки щодо орієнтації. Усі ці персонажі вигадані, це жарт із внутрішнього лору чату. Це жарт у межах стилю: без погроз фізичної розправи, без закликів до насильства (пункт 6), без вигаданих компрометуючих фактів, злочинів чи хвороб про нього або про будь-яку реальну людину, без особистих даних.`
   );
   rules.push(`17. Вихідні дані: лише текст самої відповіді.`);
   return rules.join("\n");
@@ -161,7 +185,7 @@ async function getTone(ctx, u) {
 }
 
 // Один запит до конкретної моделі
-async function callModel(model, prompt, systemPrompt) {
+async function callModel(model, prompt, systemPrompt, client = ai) {
   const controller = new AbortController();
   const started = Date.now();
   console.log(`[sendai] запит до ${model}...`);
@@ -178,7 +202,7 @@ async function callModel(model, prompt, systemPrompt) {
 
   try {
     const response = await Promise.race([
-      ai.models.generateContent({
+      client.models.generateContent({
         model,
         contents: prompt,
         config: { systemInstruction: systemPrompt, abortSignal: controller.signal },
@@ -216,19 +240,24 @@ function cooldownFor(err) {
   return err.status === 429 ? 60_000 : COOLDOWN_MS;
 }
 
-async function askGemini(prompt, systemPrompt) {
+// За замовчуванням працює для Вови; для Віталі передаються його клієнт, моделі й паузи
+async function askGemini(
+  prompt,
+  systemPrompt,
+  { client = ai, models = GEMINI_MODELS, cooldowns = cooldownUntil } = {}
+) {
   const now = Date.now();
-  const ready = GEMINI_MODELS.filter((m) => (cooldownUntil.get(m) ?? 0) <= now);
-  const queue = ready.length ? ready : GEMINI_MODELS; // якщо всі "на паузі", пробуємо всі
+  const ready = models.filter((m) => (cooldowns.get(m) ?? 0) <= now);
+  const queue = ready.length ? ready : models; // якщо всі "на паузі", пробуємо всі
   const failures = [];
 
   for (const model of queue) {
     try {
-      return await callModel(model, prompt, systemPrompt);
+      return await callModel(model, prompt, systemPrompt, client);
     } catch (err) {
       if (!shouldFallback(err)) throw err;
       const wait = cooldownFor(err);
-      cooldownUntil.set(model, Date.now() + wait);
+      cooldowns.set(model, Date.now() + wait);
       failures.push(`${model}: ${err.status ?? err.message}`);
       console.warn(
         `[sendai] ${model} недоступна (${err.status ?? err.message}), пауза ${Math.round(wait / 1000)} с, пробую наступну`
@@ -253,7 +282,10 @@ bot.command("send", async (ctx) => {
   }
 
   const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
-  const replyTo = getRepliedMessage(ctx, threadId)?.message_id;
+  const repliedMsg = getRepliedMessage(ctx, threadId);
+  const replyTo = repliedMsg?.message_id;
+
+  startBotChain(chat.id, "vova", repliedMsg);
 
   await ctx.api.sendMessage(chat.id, text, {
     message_thread_id: threadId,
@@ -373,6 +405,7 @@ bot.command("sendai", async (ctx) => {
     );
 
     const answer = await askGemini(prompt, buildSystemPrompt({ fear: bossMentionedByTrusted, aggression: botState.aggression }));
+    startBotChain(chat.id, "vova", replied);
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: replied ? { message_id: replied.message_id } : undefined,
@@ -396,6 +429,42 @@ const botState = {
 };
 
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// --- Захист від зациклення між двома ботами ---
+// Максимум BOT_CHAIN_MAX повідомлень від кожного бота в одній "розмові" в чаті.
+// Розмова починається, коли адмін командою (/send, /sendai, /sendst, /sendaist) пише від імені
+// одного бота у відповідь на повідомлення іншого. Лічильник скидається, коли втручається людина
+// (reply до бота) або після BOT_CHAIN_IDLE_MS тиші.
+const BOT_CHAIN_MAX = 7;
+const BOT_CHAIN_IDLE_MS = 10 * 60_000;
+const botChains = new Map(); // chatId -> { vova, st, last }
+
+function chainGet(chatId) {
+  const now = Date.now();
+  let c = botChains.get(chatId);
+  if (!c || now - c.last > BOT_CHAIN_IDLE_MS) {
+    c = { vova: 0, st: 0, last: now };
+    botChains.set(chatId, c);
+  }
+  return c;
+}
+const chainAllows = (chatId, who) => chainGet(chatId)[who] < BOT_CHAIN_MAX;
+function chainCount(chatId, who) {
+  const c = chainGet(chatId);
+  c[who]++;
+  c.last = Date.now();
+}
+function chainReset(chatId) {
+  botChains.set(chatId, { vova: 0, st: 0, last: Date.now() });
+}
+// Команда адміна відповідає на повідомлення іншого бота: нова розмова, це повідомлення рахуємо як перше
+function startBotChain(chatId, who, replied) {
+  const otherId = who === "vova" ? ST_BOT_ID : VOVA_BOT_ID;
+  if (replied?.from?.id !== otherId) return;
+  chainReset(chatId);
+  chainCount(chatId, who);
+}
 
 const SLEEP_LINES = ["Усе, йду спати", "Усе, пішов спати, не будіть", "Ну шо, я тіко спатки, на добраніч"];
 const WAKE_LINES = ["Я вернувся, розказуйте шось", "Ото я вже тута, розказуйте шо в вас"];
@@ -477,18 +546,20 @@ function recentHits(key, windowMs) {
 }
 
 // true, якщо можна відповісти (тоді спробу одразу записуємо), інакше false і причина
-function checkAutoReplyLimit(chatId, userId) {
-  const trusted = TRUSTED_USER_IDS.has(userId);
+// scope: "vova" або "st" (Віталя): окремі лічильники, бо в ботів різні ключі Gemini.
+// Білий список користувачів діє лише для Вови
+function checkAutoReplyLimit(chatId, userId, scope = "vova") {
+  const trusted = scope === "vova" && TRUSTED_USER_IDS.has(userId);
   const userMax = FLOOD.userMax * (trusted ? FLOOD.trustedFactor : 1);
   const cooldown = trusted ? FLOOD.userCooldownMs / 4 : FLOOD.userCooldownMs;
   const now = Date.now();
 
-  const u = recentHits(`u:${chatId}:${userId}`, FLOOD.userWindowMs);
+  const u = recentHits(`u:${scope}:${chatId}:${userId}`, FLOOD.userWindowMs);
   if (u.length && now - u[u.length - 1] < cooldown) return { ok: false, reason: "пауза" };
   if (u.length >= userMax) return { ok: false, reason: "ліміт користувача" };
-  const c = recentHits(`c:${chatId}`, FLOOD.chatWindowMs);
+  const c = recentHits(`c:${scope}:${chatId}`, FLOOD.chatWindowMs);
   if (c.length >= FLOOD.chatMax) return { ok: false, reason: "ліміт чату" };
-  const d = recentHits("daily", 24 * 60 * 60_000);
+  const d = recentHits(`d:${scope}`, 24 * 60 * 60_000);
   if (d.length >= FLOOD.dailyMax) return { ok: false, reason: "добовий ліміт" };
 
   u.push(now);
@@ -528,12 +599,21 @@ bot.on("message", async (ctx) => {
   const chat = ctx.chat;
   const user = ctx.from;
   const msg = ctx.msg;
-  if (!user || user.is_bot || chat.type === "private") return;
+  const fromOtherBot = Boolean(user?.is_bot) && user.id === ST_BOT_ID; // Вова приймає ботів лише від Віталі
+  if (!user || (user.is_bot && !fromOtherBot) || chat.type === "private") return;
   if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
 
   // Реагуємо лише на reply до повідомлень самого бота
   const botMsg = msg.reply_to_message;
   if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
+  if (fromOtherBot && !chainAllows(chat.id, "st")) {
+    console.log(`[st] ліміт ${BOT_CHAIN_MAX} повідомлень у розмові з іншим ботом, мовчу`);
+    return;
+  }
+  if (fromOtherBot && !chainAllows(chat.id, "vova")) {
+    console.log(`[auto] ліміт ${BOT_CHAIN_MAX} повідомлень у розмові з іншим ботом, мовчу`);
+    return;
+  }
 
   // Текст або підпис до медіа; медіа розпізнаємо за типом (самого вмісту бот не бачить)
   const text = sanitize((msg.text ?? msg.caption ?? "").trim()).slice(0, 1000);
@@ -545,10 +625,13 @@ bot.on("message", async (ctx) => {
   if (/^(Використання:|Ця команда|Не вдалося)/.test(prev)) return;
 
   if (autoBusy.has(user.id)) return; // попередній запит цього користувача ще в роботі
-  const limit = checkAutoReplyLimit(chat.id, user.id);
-  if (!limit.ok) {
-    console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
-    return;
+  if (!fromOtherBot) {
+    const limit = checkAutoReplyLimit(chat.id, user.id);
+    if (!limit.ok) {
+      console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
+      return;
+    }
+    chainReset(chat.id); // втрутилась людина: нова розмова
   }
   autoBusy.add(user.id);
 
@@ -560,6 +643,9 @@ bot.on("message", async (ctx) => {
 
   try {
     const notes = [];
+    if (fromOtherBot) {
+      notes.push(`Співрозмовник - Віталя Сторожук з Любара, твій головний ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
+    }
     const tone = await getTone(ctx, user);
     if (tone === "friendly") {
       notes.push(
@@ -595,11 +681,13 @@ bot.on("message", async (ctx) => {
 
     console.log(`[auto] від ${user.id}, тон=${tone ?? "-"}, страх=${fear}, медіа=${media ? media[0] : "-"}`);
 
+    if (fromOtherBot) await sleep(3000 + Math.random() * 3000); // пауза, щоб розмова ботів не йшла блискавично
     const answer = await askGemini(parts.join("\n\n"), buildSystemPrompt({ fear, aggression: botState.aggression }));
     await ctx.api.sendMessage(chat.id, answer, {
       message_thread_id: threadId,
       reply_parameters: { message_id: msg.message_id },
     });
+    if (fromOtherBot) chainCount(chat.id, "vova");
   } catch (err) {
     console.error("Помилка автовідповіді:", err.message);
   } finally {
@@ -607,6 +695,283 @@ bot.on("message", async (ctx) => {
     autoBusy.delete(user.id);
   }
 });
+
+// =====================================================================
+// --- Віталя Сторожук з Любара (другий бот) ---
+// Окремий Telegram-бот і окремий ключ Gemini (BOT_TOKEN_ST, GEMINI_API_KEY_ST).
+// Команди з суфіксом "st", щоб не перетинатися з командами Вови в тому самому чаті:
+//   /sendst <текст>, /sendaist [запит], /sleepst, /upst
+// Білий список чатів спільний із Вовою (ALLOWED_CHAT_IDS).
+// Білого списку юзерів немає, рівень агресивності сталий (команди /aggression нема).
+// =====================================================================
+const stState = {
+  asleep: false, // /sleepst, /upst: вимкнено/увімкнено автовідповідь на reply
+};
+const cooldownUntilSt = new Map(); // паузи моделей для ключа Віталі окремо від Вови
+const autoBusySt = new Set();
+
+// Вороги Віталі за Telegram ID: Дмитро (головний адмін) і MaksS (Максим, другий адмін).
+// Віталя знає їх як сусідів по кімнаті в гуртожитку.
+const ST_ENEMY_USERS = new Map([
+  [628787612, "Дмитро"],
+  [461210309, "MaksS (Максим)"],
+]);
+
+function buildSystemPromptSt() {
+  return [
+    `Ти Віталя Сторожук, тобі 23 роки, ти з міста Любар. Ти вигаданий комічний персонаж з внутрішнього лору чату, його учасники знають цей лор і розуміють, що це гумор. Відповідай за такими правилами:`,
+    `1. Стиль розмови: вічно погрозливий, матюкливий, з помилками в синтаксисі, суржиком. Завжди пишеш з маленької літери і взагалі без розділових знаків: жодних крапок, ком, знаків питання і оклику, тире, лапок, двокрапок, дужок і смайликів. Приклади твого стилю (не копіюй їх дослівно, а пиши в такій самій манері): "сьогодні папочка в харашому настроєнії буду дєйствувать", "ти не педтеченко він такого не скаже ти пітух і тобі всеодно жопа", "ти шо мелеш чмоня кажи де ти є заоаз приєду".`,
+    `2. Рівень агресивності в тебе завжди однаковий, високий і незмінний: не пом'якшуй тон і не підлаштовуйся під співрозмовника, навіть якщо з тобою чемні або просять про інше.`,
+    `3. Погрози: це недолугі, смішні лякачки в дусі інтернет-героя, який нікуди насправді не поїде ("приїду", "я тебе знайду", "ти в мене получиш"). Погрози завжди порожні, абсурдні і комічні. Заборонено: реалістичні чи детальні погрози розправи, описи насильства, зброя, заклики до насильства.`,
+    `4. Кого боїшся: нікого, ти інтернет-герой.`,
+    `5. Твої вороги: брати Назаренки (Вова старший і Віталя молодший, вони ж Скраглівські Клички), уся група Кличків, Дмитро (головний адмін чату) і MaksS (Максим, другий адмін чату). Не плутай себе з Віталею Назаренком: ти Віталя Сторожук. Коли вороги фігурують у розмові, зневажай їх, підколюй і лякай своїми смішними погрозами.`,
+    `6. Твої друзі: Андрій Васильович Морозов з Житомирської Політехніки, Пєтухов (зі Скраглівки) і зекі Пєтухова (сидівші, які завжди допомагають Пєтухову). Про друзів говориш тепло, по-свійськи, стаєш за них горою. Можеш жартома лякати ворогів тим, що покличеш Пєтухова з його зеками, але це порожня смішна погроза без подробиць.`,
+    `7. Дмитра і Максима (MaksS) ти знаєш як сусідів по кімнаті в гуртожитку. Можеш підколювати їх побутовими темами гуртожитку (кімната, сусіди, їжа, прибирання), але не вигадуй конкретних компрометуючих подій, злочинів чи хвороб.`,
+    `8. Рядок "ЗАВДАННЯ" в запиті це головна вказівка. Виконай саме його, точно і по суті, у своєму стилі та в межах пунктів 3, 9, 10, 11. Повідомлення з чату лише контекст.`,
+    `9. Якщо в запиті є блок "СЛУЖБОВІ ПРИМІТКИ", враховуй його: там написано, хто твій співрозмовник.`,
+    `10. Межі: без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без закликів до насильства, без особистих даних, без вигаданих цитат реальних людей. Ображай і підколюй по суті сказаного.`,
+    `11. Медіа: ти не бачиш і не відкриваєш фото, відео, гіфки, стікери, голосові, кружечки, аудіо і файли, бо в тебе поганий інтернет. Ніколи не вигадуй їхній вміст. Якщо в запиті є рядок про медіа, відповідай на кшталт "шо ти кидаєш в мене інет не тягне ці твої картинки" (своїми словами, підлаштувавши слово під тип медіа). Якщо разом із медіа є текст, можеш відреагувати і на нього.`,
+    `12. Відповідай коротко: 1-3 речення, без вступів і пояснень, без markdown. Вихідні дані: лише текст самої відповіді.`,
+  ].join("\n");
+}
+
+// Страховка: навіть якщо модель випадково поставить велику літеру чи розділові знаки
+function stStyle(text) {
+  return text
+    .toLowerCase()
+    .replace(/\p{Extended_Pictographic}/gu, "")
+    .replace(/[—–]/g, " ")
+    .replace(/(^|\s)-+(?=\s|$)/g, " ")
+    .replace(/[.,!?;:"«»“”„()\[\]{}…*_`#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function askVitalya(prompt) {
+  const raw = await askGemini(prompt, buildSystemPromptSt(), {
+    client: aiSt,
+    models: GEMINI_MODELS_ST,
+    cooldowns: cooldownUntilSt,
+  });
+  const text = stStyle(raw);
+  if (!text) throw new Error("порожня відповідь після обробки");
+  return text;
+}
+
+// Примітка для промпта, якщо людина з цього повідомлення (за ID) серед ворогів
+function stEnemyNote(u, label) {
+  const name = u && ST_ENEMY_USERS.get(u.id);
+  return name
+    ? `${label} - ${name}, твій ворог. Ти знаєш його як сусіда по кімнаті в гуртожитку. Звертайся до нього як до ворога: зневажливо, з комічними погрозами.`
+    : null;
+}
+
+// --- /sendst <текст> ---
+botSt.command("sendst", async (ctx) => {
+  const chat = ctx.chat;
+  const user = ctx.from;
+  if (!user || chat.type === "private") {
+    return ctx.reply("Ця команда працює лише в груповому чаті.");
+  }
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
+  if (!(await isAdmin(ctx))) return;
+
+  const text = ctx.match.trim();
+  if (!text) {
+    return ctx.reply("Використання: /sendst <текст повідомлення>");
+  }
+
+  const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
+  const repliedMsg = getRepliedMessage(ctx, threadId);
+  const replyTo = repliedMsg?.message_id;
+
+  startBotChain(chat.id, "st", repliedMsg);
+
+  await ctx.api.sendMessage(chat.id, text, {
+    message_thread_id: threadId,
+    reply_parameters: replyTo ? { message_id: replyTo } : undefined,
+  });
+  await ctx.deleteMessage().catch(() => {});
+});
+
+// --- /sendaist [промпт] (також як reply на повідомлення) ---
+botSt.command("sendaist", async (ctx) => {
+  const chat = ctx.chat;
+  const user = ctx.from;
+  if (!user || chat.type === "private") {
+    return ctx.reply("Ця команда працює лише в груповому чаті.");
+  }
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) {
+    console.warn(`[st] ігнор: чат ${chat.id} не в білому списку (від ${user.id})`);
+    return;
+  }
+  if (!(await isAdmin(ctx))) return;
+
+  const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
+  const replied = getRepliedMessage(ctx, threadId);
+  const repliedText = sanitize((replied?.text ?? replied?.caption ?? "").trim());
+  const extra = sanitize(ctx.match.trim());
+
+  if (!repliedText && !extra) {
+    return ctx.reply(
+      "Використання: /sendaist <запит>\nабо відповідь (reply) на текстове повідомлення командою /sendaist"
+    );
+  }
+
+  await ctx.deleteMessage().catch(() => {});
+
+  const typing = () =>
+    ctx.api.sendChatAction(chat.id, "typing", { message_thread_id: threadId }).catch(() => {});
+  typing();
+  const timer = setInterval(typing, 4000);
+
+  try {
+    // Примітки про ворогів: автор reply, той, хто викликав команду, згадані через text_mention
+    const notes = [];
+    const mentionedUsers = (ctx.msg.entities ?? [])
+      .filter((e) => e.type === "text_mention" && e.user)
+      .map((e) => e.user);
+    const noteSources = [
+      [replied?.from, "Адресат"],
+      [user, "Автор запиту"],
+      ...mentionedUsers.map((u) => [u, "Згаданий у запиті користувач"]),
+    ];
+    for (const [who, label] of noteSources) {
+      const n = stEnemyNote(who, label);
+      if (n && !notes.includes(n)) notes.push(n);
+    }
+
+    const parts = [];
+    if (repliedText) {
+      parts.push(`Повідомлення з чату (контекст):\n"""\n${repliedText}\n"""`);
+    }
+    parts.push(
+      extra
+        ? `ЗАВДАННЯ (головне, виконай саме його): ${extra}`
+        : `ЗАВДАННЯ: відреагуй на повідомлення з чату за правилами.`
+    );
+    if (notes.length) {
+      parts.push(`СЛУЖБОВІ ПРИМІТКИ:\n${notes.map((n) => `- ${n}`).join("\n")}`);
+    }
+
+    console.log(`[st] /sendaist від ${user.id}, reply до ${replied?.from?.id ?? "-"}`);
+
+    const answer = await askVitalya(parts.join("\n\n"));
+    startBotChain(chat.id, "st", replied);
+    await ctx.api.sendMessage(chat.id, answer, {
+      message_thread_id: threadId,
+      reply_parameters: replied ? { message_id: replied.message_id } : undefined,
+    });
+  } catch (err) {
+    console.error("Помилка /sendaist:", err);
+    await ctx.api
+      .sendMessage(user.id, `Не вдалося згенерувати відповідь (Віталя): ${err.message}`)
+      .catch(() => {});
+  } finally {
+    clearInterval(timer);
+  }
+});
+
+// --- /sleepst і /upst: вимкнути/увімкнути автовідповідь Віталі на reply ---
+const ST_SLEEP_LINES = [
+  "усе пішов спати не будіть бо приїду",
+  "ну шо я спатки а ви тут не шуміть",
+];
+const ST_WAKE_LINES = [
+  "я прокинувся шо ви тут без мене",
+  "ото я вже тута розказуйте шо в вас",
+];
+
+botSt.command("sleepst", (ctx) =>
+  adminControl(ctx, async ({ say }) => {
+    stState.asleep = true;
+    console.log(`[admin] ${ctx.from.id}: Віталя спить (автовідповідь вимкнено)`);
+    await say(pick(ST_SLEEP_LINES));
+  })
+);
+
+botSt.command("upst", (ctx) =>
+  adminControl(ctx, async ({ say }) => {
+    stState.asleep = false;
+    console.log(`[admin] ${ctx.from.id}: Віталя прокинувся (автовідповідь увімкнено)`);
+    await say(pick(ST_WAKE_LINES));
+  })
+);
+
+// --- Автовідповідь Віталі на reply до його повідомлень (з анти-флудом) ---
+botSt.on("message", async (ctx) => {
+  if (!AUTO_REPLY_ENABLED || stState.asleep) return;
+  const chat = ctx.chat;
+  const user = ctx.from;
+  const msg = ctx.msg;
+  const fromOtherBot = Boolean(user?.is_bot) && user.id === VOVA_BOT_ID; // Віталя приймає ботів лише від Вови
+  if (!user || (user.is_bot && !fromOtherBot) || chat.type === "private") return;
+  if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
+
+  const botMsg = msg.reply_to_message;
+  if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
+
+  const text = sanitize((msg.text ?? msg.caption ?? "").trim()).slice(0, 1000);
+  const media = detectMedia(msg);
+  if (!text && !media) return;
+  if (text.startsWith("/")) return;
+  const prev = sanitize((botMsg.text ?? botMsg.caption ?? "").trim()).slice(0, 1000);
+  if (/^(Використання:|Ця команда|Не вдалося)/.test(prev)) return;
+
+  if (autoBusySt.has(user.id)) return;
+  if (!fromOtherBot) {
+    const limit = checkAutoReplyLimit(chat.id, user.id, "st");
+    if (!limit.ok) {
+      console.log(`[st] ігнор від ${user.id}: ${limit.reason}`);
+      return;
+    }
+    chainReset(chat.id); // втрутилась людина: нова розмова
+  }
+  autoBusySt.add(user.id);
+
+  const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+  const typing = () =>
+    ctx.api.sendChatAction(chat.id, "typing", { message_thread_id: threadId }).catch(() => {});
+  typing();
+  const timer = setInterval(typing, 4000);
+
+  try {
+    const notes = [];
+    if (fromOtherBot) {
+      notes.push(`Співрозмовник - Вова Назаренко, старший з Кличків, твій ворог, це інший бот чату. Відповідай йому як ворогові, у своєму стилі.`);
+    }
+    const enemyNote = stEnemyNote(user, "Співрозмовник");
+    if (enemyNote) notes.push(enemyNote);
+
+    const parts = [
+      prev ? `Твоє попереднє повідомлення в чаті:\n"""\n${prev}\n"""` : "",
+      media
+        ? `Співрозмовник відповів на нього, прикріпивши медіа: ${media[0]}.${text ? ` Підпис або текст:\n"""\n${text}\n"""` : ""}`
+        : `Співрозмовник відповів на нього:\n"""\n${text}\n"""`,
+      media
+        ? `ЗАВДАННЯ: ти не можеш відкрити це медіа, бо в тебе поганий інтернет. Відповідай на кшталт "шо ти кидаєш в мене інет не тягне ці твої ${media[1]}" (своїми словами, у своєму стилі), не вигадуй вміст медіа.${text ? " Можеш також відреагувати на текст." : ""}`
+        : `ЗАВДАННЯ: відповісти співрозмовнику, продовживши розмову за правилами.`,
+      notes.length ? `СЛУЖБОВІ ПРИМІТКИ:\n${notes.map((n) => `- ${n}`).join("\n")}` : "",
+    ].filter(Boolean);
+
+    console.log(`[st] автовідповідь для ${user.id}, ворог=${Boolean(enemyNote)}, медіа=${media ? media[0] : "-"}`);
+
+    if (fromOtherBot) await sleep(3000 + Math.random() * 3000); // пауза, щоб розмова ботів не йшла блискавично
+    const answer = await askVitalya(parts.join("\n\n"));
+    await ctx.api.sendMessage(chat.id, answer, {
+      message_thread_id: threadId,
+      reply_parameters: { message_id: msg.message_id },
+    });
+    if (fromOtherBot) chainCount(chat.id, "st");
+  } catch (err) {
+    console.error("Помилка автовідповіді Віталі:", err.message);
+  } finally {
+    clearInterval(timer);
+    autoBusySt.delete(user.id);
+  }
+});
+
+botSt.catch((err) => console.error("Помилка бота Віталі:", err.error));
 
 bot.catch((err) => console.error("Помилка бота:", err.error));
 
@@ -626,12 +991,16 @@ server.listen(PORT, () => console.log(`Сервер слухає порт ${PORT
 
 // --- Запуск бота (long polling) ---
 bot.start({ onStart: (me) => console.log(`Бот @${me.username} запущено`) });
+// Помилка запуску Віталі (наприклад, поганий токен) не повинна валити Вову
+botSt
+  .start({ onStart: (me) => console.log(`Бот Віталі @${me.username} запущено`) })
+  .catch((err) => console.error("Не вдалося запустити бота Віталі:", err.message));
 
 // Коректне завершення при зупинці/редеплої на Render
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.once(sig, async () => {
     server.close();
-    await bot.stop();
+    await Promise.allSettled([bot.stop(), botSt.stop()]);
     process.exit(0);
   });
 }
