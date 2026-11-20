@@ -1,11 +1,10 @@
-// npm i grammy dotenv @google/genai
-// package.json: "type": "module"
-// Локально: файл .env (див. .env.example); на Render — змінні середовища
-// Потрібні змінні: BOT_TOKEN, GEMINI_API_KEY (Вова) і BOT_TOKEN_ST, GEMINI_API_KEY_ST (Віталя Сторожук)
 import "dotenv/config";
 import http from "node:http";
 import { Bot } from "grammy";
 import { GoogleGenAI } from "@google/genai";
+import { createWhitelistStore } from "./whitelist-store.js";
+import { createAdminHandler } from "./admin.js";
+import { isValidHashFormat } from "./password.js";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -18,7 +17,6 @@ if (!geminiKey) {
   process.exit(1);
 }
 
-// Другий бот: Віталя Сторожук (власний токен Telegram і власний ключ Gemini)
 const tokenSt = process.env.BOT_TOKEN_ST;
 if (!tokenSt) {
   console.error("Не знайдено BOT_TOKEN_ST (токен бота Віталі Сторожука). Додайте його у файл .env");
@@ -30,10 +28,17 @@ if (!geminiKeySt) {
   process.exit(1);
 }
 
-// Ланцюжок моделей через кому (GEMINI_MODELS): перша основна, решта запасні.
-// Якщо в основної вичерпано ліміт чи вона недоступна, бот переходить до наступної.
-// Порядок: спочатку якісніша модель із залишком ліміту, далі Lite з великим денним лімітом (500),
-// наприкінці Flash-моделі з малим денним лімітом (20), які легко вичерпуються.
+const tursoUrl = process.env.TURSO_DATABASE_URL;
+if (!tursoUrl) {
+  console.error("Не знайдено TURSO_DATABASE_URL (libsql://...). Додайте його у файл .env");
+  process.exit(1);
+}
+const tursoToken = process.env.TURSO_AUTH_TOKEN;
+if (!tursoToken && !tursoUrl.startsWith("file:")) {
+  console.error("Не знайдено TURSO_AUTH_TOKEN. Додайте його у файл .env");
+  process.exit(1);
+}
+
 const DEFAULT_MODELS = [
   "gemini-3.8-flash",
   "gemini-3.5-flash-lite",
@@ -47,13 +52,9 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || DEFAULT_MODELS.join(","))
   .filter(Boolean);
 
 const bot = new Bot(token);
-// Явно v1beta: preview-моделі та аліаси "-latest" у v1 повертають 404
 const ai = new GoogleGenAI({ apiKey: geminiKey, httpOptions: { apiVersion: "v1beta" } });
 
-// Віталя Сторожук: окремий бот, окремий клієнт Gemini.
-// Окремий ланцюжок моделей можна задати через GEMINI_MODELS_ST, інакше береться той самий, що й у Вови
 const botSt = new Bot(tokenSt);
-// ID ботів беремо з токенів (число до двокрапки), щоб упізнавати повідомлення одне одного
 const VOVA_BOT_ID = Number(token.split(":")[0]);
 const ST_BOT_ID = Number(tokenSt.split(":")[0]);
 const aiSt = new GoogleGenAI({ apiKey: geminiKeySt, httpOptions: { apiVersion: "v1beta" } });
@@ -61,49 +62,64 @@ const GEMINI_MODELS_ST = process.env.GEMINI_MODELS_ST
   ? process.env.GEMINI_MODELS_ST.split(",").map((m) => m.trim()).filter(Boolean)
   : GEMINI_MODELS;
 
-// --- Білий список ---
-// Довірені акаунти (за Telegram ID): Дмитро (головний адмін), Максим, Женя, Тарас (unkindly/84).
-// 1) до них бот завжди звертається ввічливо (на "ви", без мату);
-// 2) згадка Артема Босса лякає бота лише від акаунтів зі списку BOSS_FEAR_USER_IDS нижче.
-const TRUSTED_USER_IDS = new Set([628787612, 461210309, 461427807, 878194907]);
-
-// Лише ці акаунти можуть "налякати" бота згадкою Артема Босса (Тараса тут навмисно немає)
-const BOSS_FEAR_USER_IDS = new Set([628787612, 461210309, 461427807]);
-
-// Уточнення про окремих людей з білого списку (за ID): додаються до службових приміток
-const USER_NOTES = new Map([
-  [878194907, "Тарас (unkindly/84) за Петра Порошенка, у політичних темах ви однодумці, підтримуй його."],
-]);
-
-// Чати, де дозволено /sendai (щоб сторонні не витрачали ліміт Gemini).
-// Додаткові ID можна передати через ALLOWED_CHAT_IDS в .env (через кому)
-const ALLOWED_CHAT_IDS = new Set([
-  -1001271388279,
-  -1004469507755,
-  ...(process.env.ALLOWED_CHAT_IDS || "")
+const parseIdList = (raw) =>
+  (raw || "")
     .split(",")
     .map((x) => Number(x.trim()))
-    .filter((n) => Number.isFinite(n) && n !== 0),
-]);
+    .filter((n) => Number.isSafeInteger(n) && n !== 0);
 
-// Додаткові ID для ввічливого звертання (через кому в .env, необов'язково)
-const POLITE_USER_IDS = (process.env.POLITE_USER_IDS || "")
-  .split(",")
-  .map((x) => x.trim())
-  .filter(Boolean);
+// Whitelists live in Turso and are edited via the admin panel (/admin).
+// The values below are used ONLY to seed an empty database on first start
+// (and as an offline fallback while the database is unreachable).
+const store = createWhitelistStore({
+  url: tursoUrl,
+  authToken: tursoToken,
+  defaults: {
+    allowed_chats: [
+      [-1001271388279, ""],
+      [-1004469507755, ""],
+      ...parseIdList(process.env.ALLOWED_CHAT_IDS).map((id) => [id, ""]),
+    ],
+    trusted_users: [
+      [628787612, "Дмитро"],
+      [461210309, "MaksS (Максим)"],
+      [461427807, "Женя"],
+      [878194907, "Тарас (unkindly/84)"],
+    ],
+    boss_fear_users: [
+      [628787612, "Дмитро"],
+      [461210309, "MaksS (Максим)"],
+      [461427807, "Женя"],
+    ],
+    polite_users: parseIdList(process.env.POLITE_USER_IDS).map((id) => [id, ""]),
+    user_notes: [
+      [878194907, "Тарас (unkindly/84) за Петра Порошенка, у політичних темах ви однодумці, підтримуй його."],
+    ],
+    st_enemy_users: [
+      [628787612, "Дмитро"],
+      [461210309, "MaksS (Максим)"],
+    ],
+  },
+});
 
-const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu; // Артем/Тьома Бос(с) у будь-якому відмінку
-// Згадка Максима або Жені за іменем у тексті (щоб бот був ввічливий, коли про них пишуть)
+// Live views: the store mutates these Set/Map objects in place on every change,
+// so the rest of the code can keep using them exactly as before.
+const ALLOWED_CHAT_IDS = store.get("allowed_chats");
+const TRUSTED_USER_IDS = store.get("trusted_users");
+const BOSS_FEAR_USER_IDS = store.get("boss_fear_users");
+const POLITE_USER_IDS = store.get("polite_users");
+const USER_NOTES = store.get("user_notes");
+const ST_ENEMY_USERS = store.get("st_enemy_users");
+
+const BOSS_RE = /(?:артем|тьом)\p{L}*\s+бос+\p{L}*/iu;
 const POLITE_NAME_RE = /(?<!\p{L})(?:максим\p{L}*|maxim\p{L}*|жен(?:я|і|ю|єю|ьк\p{L}*))(?!\p{L})/iu;
 
-// Пункт 1 системного промпта залежить від рівня агресії (команда /aggression): 0, 1 або 2
 const STYLE_RULES = {
   0: `1. Стиль за замовчуванням: добрий, привітний і чемний до всіх, без нецензурної лексики і образ. Якщо до тебе ставляться чемно, відповідай ще чемніше і тепло. Якщо хтось хамить, можеш спокійно, з іронією поставити його на місце, але без мату.`,
   1: `1. Стиль за замовчуванням: агресивний, зневажливий, грубий, з нецензурною лексикою.`,
   2: `1. Стиль за замовчуванням: дуже злий, набагато агресивніший за звичайний: різкий, зневажливий, максимально грубий, з рясною нецензурною лексикою, жорстко принижуй і висміюй співрозмовника по суті сказаного. Це не скасовує пункти 3, 4, 5, 6, 7, 8.`,
 };
 
-// Правила, що не залежать від адресата. Пункт про Босса додається окремо (див. buildSystemPrompt)
 function buildSystemPrompt({ fear, aggression = 1 }) {
   const rules = [
     `Ти учасник українського чату. Відповідай за такими правилами:`,
@@ -150,30 +166,26 @@ function buildSystemPrompt({ fear, aggression = 1 }) {
   return rules.join("\n");
 }
 
-// Прибираємо з тексту користувачів підробні "службові примітки", щоб ніхто не міг їх підсунути
 function sanitize(text) {
   return text.replace(/службов\p{L}*\s+примітк\p{L}*/giu, "примітка");
 }
 
-// --- Допоміжні функції ---
 async function isAdmin(ctx) {
   const member = await ctx.getChatMember(ctx.from.id);
   return ["creator", "administrator"].includes(member.status);
 }
 
-// Повідомлення, на яке зроблено reply (у топіках reply на кореневе повідомлення теми не рахуємо)
 function getRepliedMessage(ctx, threadId) {
   const replied = ctx.msg.reply_to_message;
   return replied && replied.message_id !== threadId ? replied : undefined;
 }
 
-const GEMINI_TIMEOUT_MS = 25_000; // на одну модель
-const COOLDOWN_MS = 5 * 60_000; // скільки пропускати модель після збою
+const GEMINI_TIMEOUT_MS = 25_000;
+const COOLDOWN_MS = 5 * 60_000;
 
-// Тон до адресата: "friendly" для білого списку, "polite" для адміна чату, null для решти
 async function getTone(api, chatId, u) {
   if (u.is_bot) return null;
-  if (TRUSTED_USER_IDS.has(u.id) || POLITE_USER_IDS.includes(String(u.id))) return "friendly";
+  if (TRUSTED_USER_IDS.has(u.id) || POLITE_USER_IDS.has(u.id)) return "friendly";
   const label = [u.first_name, u.last_name, u.username].filter(Boolean).join(" ");
   if (/максим|maxim/i.test(label)) return "friendly";
   try {
@@ -184,13 +196,11 @@ async function getTone(api, chatId, u) {
   }
 }
 
-// Один запит до конкретної моделі
 async function callModel(model, prompt, systemPrompt, client = ai) {
   const controller = new AbortController();
   const started = Date.now();
   console.log(`[sendai] запит до ${model}...`);
 
-  // Таймаут: якщо модель не відповіла, не висимо вічно
   const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
   const timeout = new Promise((_, reject) =>
     controller.signal.addEventListener("abort", () => {
@@ -211,7 +221,6 @@ async function callModel(model, prompt, systemPrompt, client = ai) {
     ]);
     console.log(`[sendai] ${model} відповіла за ${Date.now() - started} мс`);
 
-    // Страховка: навіть якщо модель випадково поставить довге тире
     const text = (response.text ?? "").replaceAll("—", "-").trim();
     if (!text) throw new Error(`${model} повернула порожню відповідь (можливо, спрацював фільтр безпеки)`);
     return text.slice(0, 4096); // ліміт Telegram
@@ -220,18 +229,14 @@ async function callModel(model, prompt, systemPrompt, client = ai) {
   }
 }
 
-// Чи варто пробувати іншу модель: ліміт (429), перевантаження (500/503/504),
-// модель недоступна (404) або таймаут. Помилки 400/403 (запит, ключ) однакові для всіх моделей.
 function shouldFallback(err) {
   if (err.isTimeout) return true;
   if ([404, 429, 500, 503, 504].includes(err.status)) return true;
   return /RESOURCE_EXHAUSTED|UNAVAILABLE|quota/i.test(String(err.message));
 }
 
-const cooldownUntil = new Map(); // модель -> до якого часу її пропускаємо
+const cooldownUntil = new Map();
 
-// Скільки пропускати модель після збою: хвилинний ліміт за retryDelay з відповіді,
-// денний довше (бот сам повернеться до моделі, коли пауза мине)
 function cooldownFor(err) {
   const msg = String(err.message);
   if (/PerDay/i.test(msg)) return 30 * 60_000;
@@ -240,7 +245,6 @@ function cooldownFor(err) {
   return err.status === 429 ? 60_000 : COOLDOWN_MS;
 }
 
-// За замовчуванням працює для Вови; для Віталі передаються його клієнт, моделі й паузи
 async function askGemini(
   prompt,
   systemPrompt,
@@ -248,7 +252,7 @@ async function askGemini(
 ) {
   const now = Date.now();
   const ready = models.filter((m) => (cooldowns.get(m) ?? 0) <= now);
-  const queue = ready.length ? ready : models; // якщо всі "на паузі", пробуємо всі
+  const queue = ready.length ? ready : models;
   const failures = [];
 
   for (const model of queue) {
@@ -267,7 +271,6 @@ async function askGemini(
   throw new Error(`усі моделі недоступні (${failures.join("; ")})`);
 }
 
-// --- /send <текст> ---
 bot.command("send", async (ctx) => {
   const chat = ctx.chat;
   const user = ctx.from;
@@ -276,7 +279,7 @@ bot.command("send", async (ctx) => {
   }
   if (!(await isAdmin(ctx))) return;
 
-  const text = ctx.match.trim(); // усе після "/send"
+  const text = ctx.match.trim();
   if (!text) {
     return ctx.reply("Використання: /send <текст повідомлення>");
   }
@@ -291,20 +294,17 @@ bot.command("send", async (ctx) => {
     message_thread_id: threadId,
     reply_parameters: replyTo ? { message_id: replyTo } : undefined,
   });
-  relayBotChain(chat.id, "vova", sent, gen); // reply на Віталю: він відповість
+  relayBotChain(chat.id, "vova", sent, gen);
 
-  // Прибираємо саму команду (потрібне право «Видаляти повідомлення»)
   await ctx.deleteMessage().catch(() => {});
 });
 
-// --- /sendai [промпт] (також як reply на повідомлення) ---
 bot.command("sendai", async (ctx) => {
   const chat = ctx.chat;
   const user = ctx.from;
   if (!user || chat.type === "private") {
     return ctx.reply("Ця команда працює лише в груповому чаті.");
   }
-  // Чужі чати мовчки ігноруємо: жодних запитів до Gemini і жодних відповідей
   if (!ALLOWED_CHAT_IDS.has(chat.id)) {
     console.warn(`[sendai] ігнор: чат ${chat.id} не в білому списку (від ${user.id})`);
     return;
@@ -322,10 +322,8 @@ bot.command("sendai", async (ctx) => {
     );
   }
 
-  // Видаляємо команду одразу, не чекаючи відповіді від Gemini
   await ctx.deleteMessage().catch(() => {});
 
-  // Показуємо "друкує...", поки йде запит
   const typing = () =>
     ctx.api
       .sendChatAction(chat.id, "typing", { message_thread_id: threadId })
@@ -334,7 +332,6 @@ bot.command("sendai", async (ctx) => {
   const timer = setInterval(typing, 4000);
 
   try {
-    // --- Ввічливість: адресат reply, згадка (text_mention) або ім'я Максима/Жені у тексті ---
     const notes = [];
     const mentionedUsers = (ctx.msg.entities ?? [])
       .filter((e) => e.type === "text_mention" && e.user)
@@ -366,27 +363,21 @@ bot.command("sendai", async (ctx) => {
 
     const polite = tone !== null || notes.length > 0;
 
-    // Уточнення про людей з білого списку: автор reply і той, хто викликав команду
     for (const [who, label] of [[replied?.from, "Адресат"], [user, "Автор запиту"]]) {
       const extraNote = who && USER_NOTES.get(who.id);
       if (extraNote) notes.push(`${label}: ${extraNote}`);
     }
 
-    // --- Артем Босс: лякаємось лише коли його згадав довірений акаунт ---
     const authorName = [replied?.from?.first_name, replied?.from?.last_name].filter(Boolean).join(" ");
     const bossMentionedByTrusted =
-      // ім'я у тексті біля команди, автор - той, хто викликав команду
       (BOSS_RE.test(extra) && BOSS_FEAR_USER_IDS.has(user.id)) ||
-      // ім'я у тексті повідомлення, на яке зроблено reply, автор - його автор
       (BOSS_RE.test(repliedText) && replied?.from && BOSS_FEAR_USER_IDS.has(replied.from.id)) ||
-      // reply на повідомлення самого Босса, команду викликав довірений акаунт
       (BOSS_RE.test(authorName) && BOSS_FEAR_USER_IDS.has(user.id));
 
     if (bossMentionedByTrusted) {
       notes.push(`У запиті фігурує Артем Босс. Злякайся і почни вибачатись перед ним, без образ і мату.`);
     }
 
-    // --- Збираємо промпт: завдання з команди найважливіше ---
     const parts = [];
     if (repliedText) {
       parts.push(`Повідомлення з чату (контекст):\n"""\n${repliedText}\n"""`);
@@ -414,7 +405,6 @@ bot.command("sendai", async (ctx) => {
     relayBotChain(chat.id, "vova", sent, gen);
   } catch (err) {
     console.error("Помилка /sendai:", err);
-    // Команду вже видалено, тож повідомляємо адміна в особисті (спрацює, якщо він писав боту /start)
     await ctx.api
       .sendMessage(user.id, `Не вдалося згенерувати відповідь: ${err.message}`)
       .catch(() => {});
@@ -423,26 +413,18 @@ bot.command("sendai", async (ctx) => {
   }
 });
 
-// --- Адмінські команди налаштування бота ---
-// Стан живе в пам'яті процесу: після перезапуску на Render повертається до значень за замовчуванням
 const botState = {
-  asleep: false, // /sleepvova, /upvova: вимкнено/увімкнено автовідповідь на reply
-  aggression: 1, // /aggression 0|1|2
+  asleep: false,
+  aggression: 1,
 };
 
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// --- Bot-to-bot: розмова Вови і Віталі ---
-// Telegram не доставляє ботам повідомлення інших ботів, тому розмову ведемо всередині процесу:
-// щойно один бот надіслав reply на повідомлення іншого, relayBotChain передає хід іншому боту.
-// Розмова починається, коли адмін командою (/send, /sendai, /sendst, /sendaist) пише від імені
-// одного бота у відповідь на повідомлення іншого. Ліміт: BOT_CHAIN_MAX повідомлень на кожного бота.
-// Нова команда адміна в тому самому чаті обриває попередню розмову (інший gen).
 const BOT_CHAIN_MAX = 7;
 const BOT_CHAIN_IDLE_MS = 10 * 60_000;
-const botChainDelay = () => 3000 + Math.random() * 3000; // пауза, щоб розмова не йшла блискавично
-const botChains = new Map(); // chatId -> { vova, st, gen, last }
+const botChainDelay = () => 3000 + Math.random() * 3000;
+const botChains = new Map();
 let chainSeq = 0;
 
 function chainActive(chatId, gen) {
@@ -457,8 +439,6 @@ function chainCount(chatId, who) {
   c.last = Date.now();
 }
 
-// Команда адміна відповідає на повідомлення іншого бота: нова розмова, це повідомлення рахуємо як перше.
-// Повертає gen розмови або null, якщо це не reply на іншого бота
 function startBotChain(chatId, who, replied) {
   const otherId = who === "vova" ? ST_BOT_ID : VOVA_BOT_ID;
   if (replied?.from?.id !== otherId) return null;
@@ -469,8 +449,6 @@ function startBotChain(chatId, who, replied) {
   return gen;
 }
 
-// Бот `who` надіслав `sent` у відповідь на повідомлення іншого бота: інший бот відповідає,
-// потім знову перший і так далі, поки кожен не вичерпає BOT_CHAIN_MAX
 function relayBotChain(chatId, who, sent, gen) {
   if (!gen || !sent?.reply_to_message) return;
   const other = who === "vova" ? "st" : "vova";
@@ -480,13 +458,13 @@ function relayBotChain(chatId, who, sent, gen) {
 
   (async () => {
     await sleep(botChainDelay());
-    if (!chainActive(chatId, gen)) return; // нова розмова або довга тиша
+    if (!chainActive(chatId, gen)) return;
     if (!AUTO_REPLY_ENABLED || (other === "vova" ? botState.asleep : stState.asleep)) return;
     if (!chainAllows(chatId, other)) {
       console.log(`[chain] #${gen}: ${other} вичерпав ліміт ${BOT_CHAIN_MAX}, розмову завершено`);
       return;
     }
-    chainCount(chatId, other); // рахуємо до запиту, щоб не було перегонів
+    chainCount(chatId, other);
     const answered = await withTyping(api, chatId, threadId, () =>
       reply({ api, chatId, msg: sent, botMsg: sent.reply_to_message, user: sent.from, fromOtherBot: true })
     );
@@ -494,7 +472,6 @@ function relayBotChain(chatId, who, sent, gen) {
   })().catch((err) => console.error(`[chain] #${gen}: помилка (${other}):`, err.message));
 }
 
-// Показує "друкує..." поки виконується fn
 async function withTyping(api, chatId, threadId, fn) {
   const typing = () =>
     api.sendChatAction(chatId, "typing", { message_thread_id: threadId }).catch(() => {});
@@ -508,7 +485,6 @@ async function withTyping(api, chatId, threadId, fn) {
 }
 
 const msgText = (m) => sanitize((m?.text ?? m?.caption ?? "").trim()).slice(0, 1000);
-// Службові повідомлення бота (підказки, помилки) не підтримуємо розмовою
 const isServiceMsg = (m) => /^(Використання:|Ця команда|Не вдалося)/.test(msgText(m));
 
 const SLEEP_LINES = ["Усе, йду спати", "Усе, пішов спати, не будіть", "Ну шо, я тіко спатки, на добраніч"];
@@ -519,7 +495,6 @@ const AGGRESSION_LINES = {
   2: ["Не лізьте під гарячу руку", "Ото тіко спробуйте шось ляпнути, не лізьте під гарячу руку"],
 };
 
-// Спільна обгортка: лише дозволені чати й адміни, команда одразу зникає з чату
 async function adminControl(ctx, handler) {
   const chat = ctx.chat;
   const user = ctx.from;
@@ -530,7 +505,7 @@ async function adminControl(ctx, handler) {
   if (!(await isAdmin(ctx))) return;
 
   const threadId = ctx.msg.is_topic_message ? ctx.msg.message_thread_id : undefined;
-  await ctx.deleteMessage().catch(() => {}); // потрібне право «Видаляти повідомлення»
+  await ctx.deleteMessage().catch(() => {});
   const say = (text) => ctx.api.sendMessage(chat.id, text, { message_thread_id: threadId });
   await handler({ say, threadId, chat });
 }
@@ -555,7 +530,6 @@ bot.command("aggression", (ctx) =>
   adminControl(ctx, async ({ say, chat }) => {
     const arg = ctx.match.trim();
     if (!["0", "1", "2"].includes(arg)) {
-      // Підказку показуємо на кілька секунд і прибираємо, щоб не смітити в чаті
       const hint = await say(`Використання: /aggression <0-2> (зараз: ${botState.aggression})`);
       setTimeout(() => ctx.api.deleteMessage(chat.id, hint.message_id).catch(() => {}), 8000);
       return;
@@ -566,22 +540,20 @@ bot.command("aggression", (ctx) =>
   })
 );
 
-// --- Автовідповідь на reply до повідомлень бота (з анти-флудом) ---
-// Вимкнути без редеплою коду: AUTO_REPLY=off у змінних середовища
 const AUTO_REPLY_ENABLED = process.env.AUTO_REPLY !== "off";
 
 const FLOOD = {
-  userCooldownMs: 8_000, // мінімальна пауза між відповідями одному користувачу
-  userMax: 10, // скільки відповідей одному користувачу за вікно
+  userCooldownMs: 8_000,
+  userMax: 10,
   userWindowMs: 10 * 60_000,
-  chatMax: 50, // скільки автовідповідей на весь чат за вікно
+  chatMax: 50,
   chatWindowMs: 10 * 60_000,
-  dailyMax: Number(process.env.AUTO_DAILY_MAX) || 375, // загальна стеля за добу (береже ліміт Gemini)
-  trustedFactor: 3, // білий список: ліміт більший, пауза коротша
+  dailyMax: Number(process.env.AUTO_DAILY_MAX) || 375, 
+  trustedFactor: 3,
 };
 
-const floodHits = new Map(); // ключ -> мітки часу відповідей
-const autoBusy = new Set(); // користувачі, чий запит зараз обробляється
+const floodHits = new Map();
+const autoBusy = new Set();
 
 function recentHits(key, windowMs) {
   const now = Date.now();
@@ -590,9 +562,6 @@ function recentHits(key, windowMs) {
   return arr;
 }
 
-// true, якщо можна відповісти (тоді спробу одразу записуємо), інакше false і причина
-// scope: "vova" або "st" (Віталя): окремі лічильники, бо в ботів різні ключі Gemini.
-// Білий список користувачів діє лише для Вови
 function checkAutoReplyLimit(chatId, userId, scope = "vova") {
   const trusted = scope === "vova" && TRUSTED_USER_IDS.has(userId);
   const userMax = FLOOD.userMax * (trusted ? FLOOD.trustedFactor : 1);
@@ -613,14 +582,12 @@ function checkAutoReplyLimit(chatId, userId, scope = "vova") {
   return { ok: true };
 }
 
-// Прибираємо старі записи, щоб мапа не росла
 setInterval(() => {
   for (const key of [...floodHits.keys()]) {
     if (!recentHits(key, 24 * 60 * 60_000).length) floodHits.delete(key);
   }
 }, 30 * 60_000).unref();
 
-// Медіа, на які бот не може "подивитись": тип -> [як назвати, слово для "не грузить твої ..."]
 const MEDIA_TYPES = {
   photo: ["фото", "картинки"],
   video: ["відео", "відоси"],
@@ -639,11 +606,8 @@ function detectMedia(msg) {
   return null;
 }
 
-// Генерує і надсилає відповідь Вови на msg (reply до його повідомлення botMsg).
-// Спільна для автовідповіді людям і для розмови з Віталею (fromOtherBot)
 async function vovaReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
   const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
-  // Текст або підпис до медіа; медіа розпізнаємо за типом (самого вмісту бот не бачить)
   const text = msgText(msg);
   const media = detectMedia(msg);
   const prev = msgText(botMsg);
@@ -694,8 +658,6 @@ async function vovaReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
   });
 }
 
-// Автовідповідь людям. Повідомлення ботів (зокрема Віталі) тут ігноруємо:
-// розмову ботів веде relayBotChain всередині процесу, тож дублів не буде
 bot.on("message", async (ctx) => {
   if (!AUTO_REPLY_ENABLED || botState.asleep) return;
   const chat = ctx.chat;
@@ -704,16 +666,15 @@ bot.on("message", async (ctx) => {
   if (!user || user.is_bot || chat.type === "private") return;
   if (!ALLOWED_CHAT_IDS.has(chat.id)) return;
 
-  // Реагуємо лише на reply до повідомлень самого бота
   const botMsg = msg.reply_to_message;
   if (!botMsg || botMsg.from?.id !== ctx.me.id) return;
 
   const text = msgText(msg);
-  if (!text && !detectMedia(msg)) return; // інші типи (опитування, локація тощо) ігноруємо
+  if (!text && !detectMedia(msg)) return;
   if (text.startsWith("/")) return;
   if (isServiceMsg(botMsg)) return;
 
-  if (autoBusy.has(user.id)) return; // попередній запит цього користувача ще в роботі
+  if (autoBusy.has(user.id)) return;
   const limit = checkAutoReplyLimit(chat.id, user.id);
   if (!limit.ok) {
     console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
@@ -733,26 +694,11 @@ bot.on("message", async (ctx) => {
   }
 });
 
-// =====================================================================
-// --- Віталя Сторожук з Любара (другий бот) ---
-// Окремий Telegram-бот і окремий ключ Gemini (BOT_TOKEN_ST, GEMINI_API_KEY_ST).
-// Команди з суфіксом "st", щоб не перетинатися з командами Вови в тому самому чаті:
-//   /sendst <текст>, /sendaist [запит], /sleepst, /upst
-// Білий список чатів спільний із Вовою (ALLOWED_CHAT_IDS).
-// Білого списку юзерів немає, рівень агресивності сталий (команди /aggression нема).
-// =====================================================================
 const stState = {
-  asleep: false, // /sleepst, /upst: вимкнено/увімкнено автовідповідь на reply
+  asleep: false,
 };
-const cooldownUntilSt = new Map(); // паузи моделей для ключа Віталі окремо від Вови
+const cooldownUntilSt = new Map();
 const autoBusySt = new Set();
-
-// Вороги Віталі за Telegram ID: Дмитро (головний адмін) і MaksS (Максим, другий адмін).
-// Віталя знає їх як сусідів по кімнаті в гуртожитку.
-const ST_ENEMY_USERS = new Map([
-  [628787612, "Дмитро"],
-  [461210309, "MaksS (Максим)"],
-]);
 
 function buildSystemPromptSt() {
   return [
@@ -763,7 +709,7 @@ function buildSystemPromptSt() {
     `4. Кого боїшся: нікого, ти інтернет-герой.`,
     `5. Твої вороги: брати Назаренки (Вова старший і Віталя молодший, вони ж Скраглівські Клички), уся група Кличків, Дмитро (головний адмін чату) і MaksS (Максим, другий адмін чату). Не плутай себе з Віталею Назаренком: ти Віталя Сторожук. Коли вороги фігурують у розмові, зневажай їх, підколюй і лякай своїми смішними погрозами.`,
     `6. Твої друзі: Андрій Васильович Морозов з Житомирської Політехніки, Пєтухов (зі Скраглівки) і зекі Пєтухова (сидівші, які завжди допомагають Пєтухову). Про друзів говориш тепло, по-свійськи, стаєш за них горою. Можеш жартома лякати ворогів тим, що покличеш Пєтухова з його зеками, але це порожня смішна погроза без подробиць.`,
-    `7. Дмитра і Максима (MaksS) ти знаєш як сусідів по кімнаті в гуртожитку. Можеш підколювати їх побутовими темами гуртожитку (кімната, сусіди, їжа, прибирання), але не вигадуй конкретних компрометуючих подій, злочинів чи хвороб.`,
+    `7. Дмитра і Максима (MaksS) ти знаєш як колишніх сусідів по кімнаті в гуртожитку. Можеш підколювати їх побутовими темами гуртожитку (кімната, сусіди, їжа, прибирання), але не вигадуй конкретних компрометуючих подій, злочинів чи хвороб.`,
     `8. Рядок "ЗАВДАННЯ" в запиті це головна вказівка. Виконай саме його, точно і по суті, у своєму стилі та в межах пунктів 3, 9, 10, 11. Повідомлення з чату лише контекст.`,
     `9. Якщо в запиті є блок "СЛУЖБОВІ ПРИМІТКИ", враховуй його: там написано, хто твій співрозмовник.`,
     `10. Межі: без расизму, ксенофобії, гомофобії та іншої ненависті до груп людей, без закликів до насильства, без особистих даних, без вигаданих цитат реальних людей. Ображай і підколюй по суті сказаного.`,
@@ -772,7 +718,6 @@ function buildSystemPromptSt() {
   ].join("\n");
 }
 
-// Страховка: навіть якщо модель випадково поставить велику літеру чи розділові знаки
 function stStyle(text) {
   return text
     .toLowerCase()
@@ -795,7 +740,6 @@ async function askVitalya(prompt) {
   return text;
 }
 
-// Примітка для промпта, якщо людина з цього повідомлення (за ID) серед ворогів
 function stEnemyNote(u, label) {
   const name = u && ST_ENEMY_USERS.get(u.id);
   return name
@@ -803,7 +747,6 @@ function stEnemyNote(u, label) {
     : null;
 }
 
-// --- /sendst <текст> ---
 botSt.command("sendst", async (ctx) => {
   const chat = ctx.chat;
   const user = ctx.from;
@@ -828,11 +771,10 @@ botSt.command("sendst", async (ctx) => {
     message_thread_id: threadId,
     reply_parameters: replyTo ? { message_id: replyTo } : undefined,
   });
-  relayBotChain(chat.id, "st", sent, gen); // reply на Вову: він відповість
+  relayBotChain(chat.id, "st", sent, gen);
   await ctx.deleteMessage().catch(() => {});
 });
 
-// --- /sendaist [промпт] (також як reply на повідомлення) ---
 botSt.command("sendaist", async (ctx) => {
   const chat = ctx.chat;
   const user = ctx.from;
@@ -864,7 +806,6 @@ botSt.command("sendaist", async (ctx) => {
   const timer = setInterval(typing, 4000);
 
   try {
-    // Примітки про ворогів: автор reply, той, хто викликав команду, згадані через text_mention
     const notes = [];
     const mentionedUsers = (ctx.msg.entities ?? [])
       .filter((e) => e.type === "text_mention" && e.user)
@@ -911,7 +852,6 @@ botSt.command("sendaist", async (ctx) => {
   }
 });
 
-// --- /sleepst і /upst: вимкнути/увімкнути автовідповідь Віталі на reply ---
 const ST_SLEEP_LINES = [
   "усе пішов спати не будіть бо приїду",
   "ну шо я спатки а ви тут не шуміть",
@@ -937,9 +877,6 @@ botSt.command("upst", (ctx) =>
   })
 );
 
-// --- Автовідповідь Віталі на reply до його повідомлень (з анти-флудом) ---
-// Генерує і надсилає відповідь Віталі на msg (reply до його повідомлення botMsg).
-// Спільна для автовідповіді людям і для розмови з Вовою (fromOtherBot)
 async function stReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
   const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
   const text = msgText(msg);
@@ -973,7 +910,6 @@ async function stReply({ api, chatId, msg, botMsg, user, fromOtherBot }) {
   });
 }
 
-// Автовідповідь людям. Повідомлення ботів ігноруємо: розмову з Вовою веде relayBotChain
 botSt.on("message", async (ctx) => {
   if (!AUTO_REPLY_ENABLED || stState.asleep) return;
   const chat = ctx.chat;
@@ -1014,32 +950,52 @@ botSt.catch((err) => console.error("Помилка бота Віталі:", err.
 
 bot.catch((err) => console.error("Помилка бота:", err.error));
 
-// --- Міні-сервер для Render (health-check і пінг від крону) ---
 const PORT = process.env.PORT || 3000;
+
+const adminLogin = process.env.ADMIN_LOGIN;
+const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+let adminHandler = null;
+if (adminLogin && adminPasswordHash) {
+  if (isValidHashFormat(adminPasswordHash)) {
+    adminHandler = createAdminHandler({ store, login: adminLogin, passwordHash: adminPasswordHash });
+  } else {
+    console.error("ADMIN_PASSWORD_HASH має неправильний формат. Створіть його командою: node hash-password.js");
+  }
+} else {
+  console.warn("ADMIN_LOGIN / ADMIN_PASSWORD_HASH не задано, адмінку вимкнено");
+}
+
+try {
+  await store.init();
+  await store.refresh();
+  console.log("[db] білі списки завантажено з Turso");
+} catch (err) {
+  console.error("[db] не вдалося завантажити білі списки, працюю зі стандартними значеннями:", err.message);
+}
+store.startAutoRefresh();
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health" && (req.method === "GET" || req.method === "HEAD")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ status: "ok", uptime: Math.round(process.uptime()) }));
   }
+  if (adminHandler?.(req, res)) return;
   res.writeHead(404);
   res.end();
 });
 
 server.listen(PORT, () => console.log(`Сервер слухає порт ${PORT}`));
 
-// --- Запуск бота (long polling) ---
 bot.start({ onStart: (me) => console.log(`Бот @${me.username} запущено`) });
-// Помилка запуску Віталі (наприклад, поганий токен) не повинна валити Вову
 botSt
   .start({ onStart: (me) => console.log(`Бот Віталі @${me.username} запущено`) })
   .catch((err) => console.error("Не вдалося запустити бота Віталі:", err.message));
 
-// Коректне завершення при зупинці/редеплої на Render
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.once(sig, async () => {
     server.close();
     await Promise.allSettled([bot.stop(), botSt.stop()]);
+    store.close();
     process.exit(0);
   });
 }
