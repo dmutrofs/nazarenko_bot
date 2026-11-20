@@ -582,9 +582,59 @@ function checkAutoReplyLimit(chatId, userId, scope = "vova") {
   return { ok: true };
 }
 
+// Canned replies for users who hit the flood limit (no Gemini call, so it costs nothing).
+const FLOOD_REPLIES = {
+  vova: [
+    "Іди гуляй, я Бердичівське п'ю",
+    "Ти що, здурів, я отдихаю з пацанами!???",
+    "Шо ти тута пристав, я Десанта відкрив, не заважай",
+    "Тіко не зараз, я з пацанами на лавці сиджу",
+    "Відчепись, у мене тута перекур, Приму засмалив",
+    "Та почекай ти, шо за нетерплячка, дай пивко допити",
+    "Не бачиш, я зайнятий, налили вже, не муть воду",
+    "Ото причепився, іди в Скраглівку погуляй, не до тебе",
+    "Мухтар уже на тебе гарчить, відстань по-хорошому",
+    "Шо ти мене смикаєш, я з корефанами Союз-Віктан дегустую",
+  ],
+  st: [
+    "жди жди доберусь іще до тебе",
+    "не наривайся шляпа",
+    "я атдихаю відцепись",
+    "чьо ти пристав я зайнятий не до тебе",
+    "ще раз тикнеш і приїду буду дєйствувать",
+    "малий відчепись тута папочка отдихає",
+    "не чіпай мене шо ти як мала дитина",
+    "іди в баню я зараз занятий",
+  ],
+};
+// At most one canned reply per user per this interval, so the bot does not spam the chat itself.
+const FLOOD_REPLY_COOLDOWN_MS = 20_000;
+const lastFloodReply = new Map();
+
+async function sendFloodReply(ctx, scope) {
+  const key = `${scope}:${ctx.chat.id}:${ctx.from.id}`;
+  const now = Date.now();
+  if (now - (lastFloodReply.get(key) ?? 0) < FLOOD_REPLY_COOLDOWN_MS) return;
+  lastFloodReply.set(key, now);
+
+  const msg = ctx.msg;
+  const threadId = msg.is_topic_message ? msg.message_thread_id : undefined;
+  const phrase = pick(FLOOD_REPLIES[scope]);
+  await ctx.api
+    .sendMessage(ctx.chat.id, scope === "st" ? stStyle(phrase) : phrase, {
+      message_thread_id: threadId,
+      reply_parameters: { message_id: msg.message_id },
+    })
+    .catch((err) => console.warn(`[flood] не вдалося надіслати відповідь (${scope}):`, err.message));
+}
+
 setInterval(() => {
   for (const key of [...floodHits.keys()]) {
     if (!recentHits(key, 24 * 60 * 60_000).length) floodHits.delete(key);
+  }
+  const now = Date.now();
+  for (const [key, t] of lastFloodReply) {
+    if (now - t > FLOOD_REPLY_COOLDOWN_MS) lastFloodReply.delete(key);
   }
 }, 30 * 60_000).unref();
 
@@ -677,7 +727,8 @@ bot.on("message", async (ctx) => {
   if (autoBusy.has(user.id)) return;
   const limit = checkAutoReplyLimit(chat.id, user.id);
   if (!limit.ok) {
-    console.log(`[auto] ігнор від ${user.id}: ${limit.reason}`);
+    console.log(`[auto] ліміт для ${user.id}: ${limit.reason}`);
+    await sendFloodReply(ctx, "vova");
     return;
   }
   autoBusy.add(user.id);
@@ -810,9 +861,17 @@ botSt.command("sendaist", async (ctx) => {
     const mentionedUsers = (ctx.msg.entities ?? [])
       .filter((e) => e.type === "text_mention" && e.user)
       .map((e) => e.user);
+    // When the admin replies to Vova's message, the admin only gives the task:
+    // the addressee is Vova (the other bot), not the admin.
+    const repliesToVova = replied?.from?.id === VOVA_BOT_ID;
+    if (repliesToVova) {
+      notes.push(
+        `Адресат - Вова Назаренко, старший з Кличків, твій ворог, це інший бот чату. Автор запиту (адмін) лише дав тобі завдання і не є співрозмовником. Відповідай саме Вові, звертайся до нього, а не до адміна.`
+      );
+    }
     const noteSources = [
       [replied?.from, "Адресат"],
-      [user, "Автор запиту"],
+      ...(repliesToVova ? [] : [[user, "Автор запиту"]]),
       ...mentionedUsers.map((u) => [u, "Згаданий у запиті користувач"]),
     ];
     for (const [who, label] of noteSources) {
@@ -822,7 +881,11 @@ botSt.command("sendaist", async (ctx) => {
 
     const parts = [];
     if (repliedText) {
-      parts.push(`Повідомлення з чату (контекст):\n"""\n${repliedText}\n"""`);
+      parts.push(
+        repliesToVova
+          ? `Повідомлення Вови Назаренка, на яке ти відповідаєш:\n"""\n${repliedText}\n"""`
+          : `Повідомлення з чату (контекст):\n"""\n${repliedText}\n"""`
+      );
     }
     parts.push(
       extra
@@ -929,7 +992,8 @@ botSt.on("message", async (ctx) => {
   if (autoBusySt.has(user.id)) return;
   const limit = checkAutoReplyLimit(chat.id, user.id, "st");
   if (!limit.ok) {
-    console.log(`[st] ігнор від ${user.id}: ${limit.reason}`);
+    console.log(`[st] ліміт для ${user.id}: ${limit.reason}`);
+    await sendFloodReply(ctx, "st");
     return;
   }
   autoBusySt.add(user.id);
